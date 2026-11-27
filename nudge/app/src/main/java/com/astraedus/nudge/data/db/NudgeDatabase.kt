@@ -1,0 +1,250 @@
+package com.astraedus.nudge.data.db
+
+import androidx.room.Database
+import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+import com.astraedus.nudge.data.db.dao.AppGroupDao
+import com.astraedus.nudge.data.db.dao.BlockRuleDao
+import com.astraedus.nudge.data.db.dao.UsageEventDao
+import com.astraedus.nudge.data.db.entity.AppGroup
+import com.astraedus.nudge.data.db.entity.AppGroupMember
+import com.astraedus.nudge.data.db.entity.BlockRule
+import com.astraedus.nudge.data.db.entity.UsageEvent
+
+/**
+ * The schema version, as ONE declaration that both the `@Database` annotation and the migration test
+ * read.
+ *
+ * It is a top-level `const` rather than a literal inside the annotation because a JVM test cannot see
+ * the annotation at all: Room declares `@Database` with BINARY retention, so
+ * `NudgeDatabase::class.java.getAnnotation(Database::class.java)` returns null at runtime and any test
+ * "deriving" the version that way gets a `NullPointerException` (it did — this constant is what
+ * replaced that).
+ *
+ * The alternative was a hand-kept `currentVersion` in the test, which is precisely the fixture-honesty
+ * failure `tasks/lessons.md` records for `PassthroughTest`'s `ownPackageName` (2026-09-21): a second
+ * copy of a production value agrees with whoever last edited it rather than with production, and it
+ * keeps passing forever after a bump nobody remembered to make twice. One constant, two readers, and
+ * the compiler holds them together.
+ */
+internal const val NUDGE_DB_VERSION = 16
+
+@Database(
+    entities = [
+        BlockRule::class,
+        AppGroup::class,
+        AppGroupMember::class,
+        UsageEvent::class
+    ],
+    version = NUDGE_DB_VERSION,
+    exportSchema = false
+)
+abstract class NudgeDatabase : RoomDatabase() {
+    abstract fun blockRuleDao(): BlockRuleDao
+    abstract fun appGroupDao(): AppGroupDao
+    abstract fun usageEventDao(): UsageEventDao
+
+    companion object {
+        val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                // Schedule-based rules
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN scheduleDays TEXT")
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN scheduleStartMinute INTEGER")
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN scheduleEndMinute INTEGER")
+                // In-app feature blocking
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN inAppFeatures TEXT")
+                // Grayscale mode
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN grayscale INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE usage_events ADD COLUMN userChangedMind INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN showCounter INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN autoKickAfter INTEGER DEFAULT NULL")
+            }
+        }
+
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN showTimeRemaining INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN autoKickCooldownSeconds INTEGER NOT NULL DEFAULT 60")
+            }
+        }
+
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN webDomains TEXT DEFAULT NULL")
+            }
+        }
+
+        /** Time-based auto-kick threshold, in minutes of session foreground time (NULL = off). */
+        val MIGRATION_7_8 = object : Migration(7, 8) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN autoKickAfterMinutes INTEGER DEFAULT NULL")
+            }
+        }
+
+        /**
+         * Drops the dead `usage_events.durationMs` column (issue #22).
+         *
+         * SQLite before 3.35 has no `DROP COLUMN`, and minSdk 26 ships far older engines, so this
+         * is the standard create/copy/drop/rename recreate. The new table must match Room's
+         * generated schema for [com.astraedus.nudge.data.db.entity.UsageEvent] byte for byte or
+         * Room's post-migration validation throws on the next open.
+         *
+         * The column was never written, so nothing of value is copied away — but the ROWS are
+         * user data (block/allow history behind the stats screen) and are carried across.
+         */
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `usage_events_new` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`packageName` TEXT NOT NULL, " +
+                        "`timestamp` INTEGER NOT NULL, " +
+                        "`wasBlocked` INTEGER NOT NULL, " +
+                        "`blockMode` TEXT, " +
+                        "`userChangedMind` INTEGER NOT NULL)"
+                )
+                db.execSQL(
+                    "INSERT INTO `usage_events_new` " +
+                        "(`id`, `packageName`, `timestamp`, `wasBlocked`, `blockMode`, `userChangedMind`) " +
+                        "SELECT `id`, `packageName`, `timestamp`, `wasBlocked`, `blockMode`, `userChangedMind` " +
+                        "FROM `usage_events`"
+                )
+                db.execSQL("DROP TABLE `usage_events`")
+                db.execSQL("ALTER TABLE `usage_events_new` RENAME TO `usage_events`")
+            }
+        }
+
+        /**
+         * Independent block mode for a rule's web domains (issue #21). NULL = inherit the
+         * app-level `mode`, so every existing rule keeps its exact current behaviour.
+         *
+         * The one deliberate behaviour change is the second statement. Rules with `mode = 'NONE'`
+         * AND configured `webDomains` are the bug: web enforcement ran through the app-level mode,
+         * so those domains silently blocked NOTHING, the worst failure class for a blocker. Such
+         * rows exist in the wild (the editor kept previously-entered domains when whole-app
+         * blocking was switched off), and they were only ever reachable by a user who had opted
+         * into web blocking. They are repaired to DELAY rather than HARD_BLOCK: the rule already
+         * carries a `delaySeconds`, and DELAY matches the fallback the editor itself uses when
+         * there is no prior blocking choice to restore. The user can change it in the editor,
+         * which now shows the website mode explicitly.
+         */
+        val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN webBlockMode TEXT DEFAULT NULL")
+                db.execSQL(
+                    "UPDATE block_rules SET webBlockMode = 'DELAY' " +
+                        "WHERE mode = 'NONE' AND webDomains IS NOT NULL AND webDomains != ''"
+                )
+            }
+        }
+
+        /**
+         * Adds Tab Vanish and the experimental Following steer (v1.18.0), per-rule columns backing
+         * [com.astraedus.nudge.data.db.entity.BlockRule.tabVanish] and
+         * [com.astraedus.nudge.data.db.entity.BlockRule.followingSteer].
+         *
+         * Both default to what a pre-migration rule already meant, not to the code-level default:
+         * `tabVanish = 1` because every rule that existed before this feature had no cover at all,
+         * and restoring one to the entity's new default (on) is the correct reading of "this rule
+         * hard-blocks Instagram REELS" now that the app can express a cover; `followingSteer = 0`
+         * because the steer is a brand-new, opt-in, experimental capability no existing rule ever
+         * asked for.
+         */
+        val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN tabVanish INTEGER NOT NULL DEFAULT 1")
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN followingSteer INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /**
+         * Adds the usage reminder (issue #77), the per-rule column backing
+         * [com.astraedus.nudge.data.db.entity.BlockRule.remindAfterMinutes]: minutes of foreground
+         * time in one session before Nudge posts a single gentle notification (NULL = off).
+         *
+         * NULL is the right reading for every pre-migration rule: none of them ever asked for a
+         * reminder, so upgrading must not start nudging anyone about an app they never configured.
+         * Nullable with no `NOT NULL`, same shape as `autoKickAfterMinutes` (7 -> 8).
+         */
+        val MIGRATION_11_12 = object : Migration(11, 12) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN remindAfterMinutes INTEGER DEFAULT NULL")
+            }
+        }
+
+        /**
+         * Adds "keep the pass on short trips" (issue #110), the per-rule column backing
+         * [com.astraedus.nudge.data.db.entity.BlockRule.keepPassOnShortTrips].
+         *
+         * 0 for every pre-migration rule: the option is opt-in, and upgrading must not change when
+         * anyone's pass ends. Same `NOT NULL DEFAULT` shape as `followingSteer` (10 -> 11).
+         */
+        val MIGRATION_12_13 = object : Migration(12, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN keepPassOnShortTrips INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /**
+         * Adds "All apps except a few" (spec 5.1, PR 4): the target flag and the rule's allowed
+         * apps and allowed groups, backing [com.astraedus.nudge.data.db.entity.BlockRule.allApps],
+         * [com.astraedus.nudge.data.db.entity.BlockRule.exceptPackages] and
+         * [com.astraedus.nudge.data.db.entity.BlockRule.exceptGroupIds].
+         *
+         * Additive only: every existing rule reads `allApps = 0` with no allowed lists, so it keeps
+         * exactly the target (one app or one group) it had.
+         */
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN allApps INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN exceptPackages TEXT DEFAULT NULL")
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN exceptGroupIds TEXT DEFAULT NULL")
+            }
+        }
+
+        /**
+         * Category groups (spec 5.1/5.2, PR 6). `app_groups.categories` is a CSV of category names
+         * (`SOCIAL,VIDEO`); NULL keeps every existing group hand-picked only. `excluded` = 1 marks a
+         * "Removed by you" row (a category app taken out by hand); DEFAULT 0 keeps every existing
+         * member row an include, so an upgraded group covers exactly the apps it covered before.
+         */
+        val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE app_groups ADD COLUMN categories TEXT DEFAULT NULL")
+                db.execSQL("ALTER TABLE app_group_members ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+
+        /**
+         * First-unlock schedules (spec 5.1, PR 5b), backing
+         * [com.astraedus.nudge.data.db.entity.BlockRule.firstUnlockMinutes] and
+         * [com.astraedus.nudge.data.db.entity.BlockRule.armedAt].
+         *
+         * Additive only: every existing rule reads `firstUnlockMinutes = NULL` (not a first-unlock
+         * rule, so its days-and-times schedule keeps its exact meaning) and `armedAt = 0` ("always
+         * armed"), so nothing about an upgraded phone's current windows changes.
+         */
+        val MIGRATION_15_16 = object : Migration(15, 16) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN firstUnlockMinutes INTEGER DEFAULT NULL")
+                db.execSQL("ALTER TABLE block_rules ADD COLUMN armedAt INTEGER NOT NULL DEFAULT 0")
+            }
+        }
+    }
+}

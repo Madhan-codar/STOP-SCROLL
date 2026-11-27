@@ -1,0 +1,836 @@
+package com.astraedus.nudge.data.preferences
+
+import android.content.Context
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.MutablePreferences
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import com.astraedus.nudge.data.export.ExportedSettings
+import com.astraedus.nudge.domain.engine.FirstUnlockWindow
+import com.astraedus.nudge.domain.ContentFilterAllowlist
+import com.astraedus.nudge.domain.ContentFilterBlocklist
+import com.astraedus.nudge.domain.ContentFilterUserList
+import com.astraedus.nudge.domain.nuke.NukeClockReading
+import com.astraedus.nudge.domain.nuke.NukeKeyKind
+import com.astraedus.nudge.domain.nuke.NukeProfile
+import com.astraedus.nudge.domain.nuke.NukeProfiles
+import com.astraedus.nudge.domain.nuke.NukeTimer
+import com.astraedus.nudge.domain.nuke.NukeState
+import com.astraedus.nudge.domain.nudge.PhoneNudge
+import com.astraedus.nudge.service.GlobalEnabledProvider
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import javax.inject.Inject
+import javax.inject.Singleton
+
+private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "nudge_prefs")
+
+/**
+ * Every setting the app keeps, each with its default, over one [DataStore].
+ *
+ * The primary constructor takes the store itself so a JVM test can run THIS class, defaults and
+ * read-modify-write rules included, over an in-memory store (`testing/FakeNudgePreferences.kt`)
+ * instead of a mock that restates each default by hand. The app only ever builds it from a
+ * [Context], through the `@Inject` constructor below.
+ */
+@Singleton
+class NudgePreferences internal constructor(
+    private val dataStore: DataStore<Preferences>
+) : GlobalEnabledProvider {
+
+    @Inject
+    constructor(@ApplicationContext context: Context) : this(context.dataStore)
+
+    private object Keys {
+        val GLOBAL_ENABLED = booleanPreferencesKey("global_enabled")
+        val ONBOARDING_COMPLETE = booleanPreferencesKey("onboarding_complete")
+        val DEBUG_LOGGING_ENABLED = booleanPreferencesKey("debug_logging_enabled")
+        val CONTENT_FILTER_ENABLED = booleanPreferencesKey("content_filter_enabled")
+        val CONTENT_FILTER_MODE = stringPreferencesKey("content_filter_mode")
+        val CONTENT_FILTER_STRICT_KEYWORDS = booleanPreferencesKey("content_filter_strict_keywords")
+        val CONTENT_FILTER_ALLOWLIST = stringSetPreferencesKey("content_filter_allowlist")
+        val CONTENT_FILTER_BLOCKLIST = stringSetPreferencesKey("content_filter_blocklist")
+        val CUSTOM_DELAY_TITLES = stringPreferencesKey("custom_delay_titles")
+        val CUSTOM_DELAY_SUBTITLES = stringPreferencesKey("custom_delay_subtitles")
+        val CUSTOM_HARD_BLOCK_MESSAGES = stringPreferencesKey("custom_hard_block_messages")
+        val STRICT_MODE_ENABLED = booleanPreferencesKey("strict_mode_enabled")
+        val STRICT_MODE_CHALLENGE_LENGTH = intPreferencesKey("strict_mode_challenge_length")
+        val EMERGENCY_PASS_ENABLED = booleanPreferencesKey("emergency_pass_enabled")
+        val EMERGENCY_PASS_USAGE = stringPreferencesKey("emergency_pass_usage")
+        val BOUNCE_CHECK_IN_ENABLED = booleanPreferencesKey("bounce_check_in_enabled")
+        val CAMERA_ON_BLOCK_SCREENS = booleanPreferencesKey("camera_on_block_screens")
+        val PHONE_NUDGE_ENABLED = booleanPreferencesKey("phone_nudge_enabled")
+        val PHONE_NUDGE_THRESHOLD_MINUTES = intPreferencesKey("phone_nudge_threshold_minutes")
+        val PHONE_NUDGE_PAUSE_SECONDS = intPreferencesKey("phone_nudge_pause_seconds")
+        val PIP_ESCAPE_PROMPTED = stringPreferencesKey("pip_escape_prompted")
+        val PROTECTION_DEGRADED = booleanPreferencesKey("protection_degraded")
+        val PROTECTION_ALERT_SHOWN_AT = longPreferencesKey("protection_alert_shown_at")
+
+        // First-unlock schedules (spec 5.1). DAY_START_MINUTE is a user setting a backup carries;
+        // FIRST_UNLOCK_AT is a fact about this phone's day, never exported.
+        val DAY_START_MINUTE = intPreferencesKey("day_start_minute")
+        val FIRST_UNLOCK_AT = longPreferencesKey("first_unlock_at")
+
+        // Nuke Mode (docs/architecture/nuke-mode.md). DEVICE-LOCAL, like the emergency-pass
+        // ledger: never exported, never importable (pinned by ImportedSettingsWriteContractTest).
+        val NUKE_ACTIVE = booleanPreferencesKey("nuke_active")
+        val NUKE_PACKAGES = stringSetPreferencesKey("nuke_packages")
+        val NUKE_KEY_HASH = stringPreferencesKey("nuke_key_hash")
+        val NUKE_KEY_KIND = stringPreferencesKey("nuke_key_kind")
+        val NUKE_INTRO_SEEN = booleanPreferencesKey("nuke_intro_seen")
+
+        // Nuke profiles (#183) and the timer (#184). Same rule: device-local, never in a backup.
+        val NUKE_PROFILES = stringPreferencesKey("nuke_profiles")
+        val NUKE_TIMER_DURATION_MS = longPreferencesKey("nuke_timer_duration_ms")
+        val NUKE_TIMER_CONSUMED_MS = longPreferencesKey("nuke_timer_consumed_ms")
+        val NUKE_TIMER_BOOT_COUNT = intPreferencesKey("nuke_timer_boot_count")
+        val NUKE_TIMER_SEGMENT_START_MS = longPreferencesKey("nuke_timer_segment_start_ms")
+        val NUKE_TIMER_CHOICE_MINUTES = intPreferencesKey("nuke_timer_choice_minutes")
+    }
+
+    /**
+     * The master toggle.
+     *
+     * `distinctUntilChanged` is load-bearing, not tidiness. DataStore's `data` flow re-emits the
+     * WHOLE preferences snapshot on every write to ANY key, and `map` happily republishes the same
+     * Boolean each time. `NudgeAccessibilityService` collects this and calls
+     * `NudgeMonitorService.sync` on each emission, and `sync` -> `start` -> `onStartCommand` ->
+     * `startForeground` is a notification post — so before this line, every unrelated preference
+     * write in the app (including the one `ProtectionCheck` makes on every watchdog cycle) posted
+     * the ongoing notification again and took a `NotificationManagerService` wakelock for it. That
+     * is one of the three causes of [#63](https://github.com/astraedus/nudge/issues/63), and it is
+     * the one no amount of care inside the service could have fixed.
+     *
+     * Nothing may depend on this re-emitting an unchanged value: that was never a signal, only a
+     * side effect of which key someone else happened to write.
+     */
+    override val isGlobalEnabled: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.GLOBAL_ENABLED] ?: true }
+        .distinctUntilChanged()
+
+    suspend fun setGlobalEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.GLOBAL_ENABLED] = enabled
+        }
+    }
+
+    /** Same reason as [isGlobalEnabled]: this pair drives the monitor service's existence. */
+    val isOnboardingComplete: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.ONBOARDING_COMPLETE] ?: false }
+        .distinctUntilChanged()
+
+    suspend fun setOnboardingComplete(complete: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.ONBOARDING_COMPLETE] = complete
+        }
+    }
+
+    val isDebugLoggingEnabled: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.DEBUG_LOGGING_ENABLED] ?: false }
+
+    suspend fun setDebugLoggingEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.DEBUG_LOGGING_ENABLED] = enabled
+        }
+    }
+
+    /** Generic "Content Filter" master switch. Opt-in: defaults to false. */
+    val contentFilterEnabled: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.CONTENT_FILTER_ENABLED] ?: false }
+
+    suspend fun setContentFilterEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CONTENT_FILTER_ENABLED] = enabled
+        }
+    }
+
+    /** Block mode applied to content-filter hits. One of BlockMode names. Defaults to HARD_BLOCK. */
+    val contentFilterMode: Flow<String> = dataStore.data
+        .map { prefs -> prefs[Keys.CONTENT_FILTER_MODE] ?: "HARD_BLOCK" }
+
+    suspend fun setContentFilterMode(mode: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CONTENT_FILTER_MODE] = mode
+        }
+    }
+
+    /**
+     * Opt-in sub-toggle of the content filter that also matches ambiguous keyword terms
+     * found in a URL's search query. Defaults to false so the general userbase is
+     * unaffected; only matters when [contentFilterEnabled] is also on.
+     */
+    val contentFilterStrictKeywords: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.CONTENT_FILTER_STRICT_KEYWORDS] ?: false }
+
+    suspend fun setContentFilterStrictKeywords(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CONTENT_FILTER_STRICT_KEYWORDS] = enabled
+        }
+    }
+
+    /**
+     * "Allowed words & sites": the user's exceptions to strict keyword matching (issue #78), stored
+     * in canonical form ([ContentFilterUserList.normalize]). They only ever excuse a strict-layer
+     * hit; see [ContentFilterAllowlist] for what they can never override.
+     *
+     * Adding an entry WEAKENS the filter, so the screen routes additions through the Strict Mode
+     * gate ([com.astraedus.nudge.domain.lock.ContentFilterAllowlistWeakening]); these writers do not
+     * gate, exactly like every other setter here.
+     */
+    val contentFilterAllowlist: Flow<Set<String>> = dataStore.data
+        .map { prefs -> prefs[Keys.CONTENT_FILTER_ALLOWLIST] ?: emptySet() }
+        .distinctUntilChanged()
+
+    /** Add one entry, normalised; invalid input is dropped and the [ContentFilterUserList.MAX_ENTRIES] cap holds. */
+    suspend fun addContentFilterAllowlistEntry(raw: String) {
+        dataStore.edit { prefs ->
+            val current = prefs[Keys.CONTENT_FILTER_ALLOWLIST] ?: emptySet()
+            prefs[Keys.CONTENT_FILTER_ALLOWLIST] =
+                ContentFilterUserList.withEntry(current, raw).toSet()
+        }
+    }
+
+    /** Remove one entry. Always allowed: removing an exception can only block more. */
+    suspend fun removeContentFilterAllowlistEntry(entry: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CONTENT_FILTER_ALLOWLIST] =
+                (prefs[Keys.CONTENT_FILTER_ALLOWLIST] ?: emptySet()) - entry
+        }
+    }
+
+    /**
+     * "Blocked words & sites": the user's own additions to the content filter, stored in canonical
+     * form ([ContentFilterUserList.normalize]). Live whenever the content filter is on; deliberately
+     * NOT behind [contentFilterStrictKeywords], because that toggle ships off and a user's own word
+     * would then look broken.
+     *
+     * Removing an entry WEAKENS the filter, so the screen routes removals through the Strict Mode
+     * gate ([com.astraedus.nudge.domain.lock.ContentFilterBlocklistWeakening]); these writers do not
+     * gate, exactly like every other setter here.
+     */
+    val contentFilterBlocklist: Flow<Set<String>> = dataStore.data
+        .map { prefs -> prefs[Keys.CONTENT_FILTER_BLOCKLIST] ?: emptySet() }
+        .distinctUntilChanged()
+
+    /** Add one entry, normalised; invalid input is dropped and the [ContentFilterUserList.MAX_ENTRIES] cap holds. */
+    suspend fun addContentFilterBlocklistEntry(raw: String) {
+        dataStore.edit { prefs ->
+            val current = prefs[Keys.CONTENT_FILTER_BLOCKLIST] ?: emptySet()
+            prefs[Keys.CONTENT_FILTER_BLOCKLIST] =
+                ContentFilterUserList.withEntry(current, raw).toSet()
+        }
+    }
+
+    /** Remove one entry. Removing a block weakens the filter; the caller owns the Strict Mode gate. */
+    suspend fun removeContentFilterBlocklistEntry(entry: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CONTENT_FILTER_BLOCKLIST] =
+                (prefs[Keys.CONTENT_FILTER_BLOCKLIST] ?: emptySet()) - entry
+        }
+    }
+
+    /**
+     * User-edited overlay messages, one per line. Empty string ("") means "use the
+     * built-in defaults" — resolved via [com.astraedus.nudge.ui.overlay.NudgeMessages.resolvePool].
+     */
+    val customDelayTitles: Flow<String> = dataStore.data
+        .map { prefs -> prefs[Keys.CUSTOM_DELAY_TITLES] ?: "" }
+
+    suspend fun setCustomDelayTitles(value: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CUSTOM_DELAY_TITLES] = value
+        }
+    }
+
+    val customDelaySubtitles: Flow<String> = dataStore.data
+        .map { prefs -> prefs[Keys.CUSTOM_DELAY_SUBTITLES] ?: "" }
+
+    suspend fun setCustomDelaySubtitles(value: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CUSTOM_DELAY_SUBTITLES] = value
+        }
+    }
+
+    val customHardBlockMessages: Flow<String> = dataStore.data
+        .map { prefs -> prefs[Keys.CUSTOM_HARD_BLOCK_MESSAGES] ?: "" }
+
+    suspend fun setCustomHardBlockMessages(value: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.CUSTOM_HARD_BLOCK_MESSAGES] = value
+        }
+    }
+
+    /**
+     * Strict Mode ("commitment lock") master switch. Opt-in: defaults to false. While on, any
+     * action that WEAKENS protection — including turning this off — requires passing the unlock
+     * challenge. Strengthening protection is always free.
+     */
+    val isStrictModeEnabled: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.STRICT_MODE_ENABLED] ?: false }
+
+    suspend fun setStrictModeEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.STRICT_MODE_ENABLED] = enabled
+        }
+    }
+
+    /**
+     * Strict Mode challenge difficulty: number of raw characters the user must type to unlock.
+     * Defaults to [com.astraedus.nudge.domain.lock.StrictModeChallenge.DEFAULT_LENGTH] (24).
+     */
+    val strictModeChallengeLength: Flow<Int> = dataStore.data
+        .map { prefs ->
+            prefs[Keys.STRICT_MODE_CHALLENGE_LENGTH]
+                ?: com.astraedus.nudge.domain.lock.StrictModeChallenge.DEFAULT_LENGTH
+        }
+
+    suspend fun setStrictModeChallengeLength(length: Int) {
+        dataStore.edit { prefs ->
+            prefs[Keys.STRICT_MODE_CHALLENGE_LENGTH] = length
+        }
+    }
+
+    /**
+     * Master toggle for the "2-minute daily pass" emergency escape hatch. Defaults to true (the
+     * escape hatch is available out of the box); users can disable it entirely. Independent of Strict
+     * Mode, which hides the pass button while it is on.
+     */
+    val emergencyPassEnabled: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.EMERGENCY_PASS_ENABLED] ?: true }
+
+    suspend fun setEmergencyPassEnabled(enabled: Boolean) {
+        dataStore.edit { prefs ->
+            prefs[Keys.EMERGENCY_PASS_ENABLED] = enabled
+        }
+    }
+
+    /**
+     * The "Bro. wtf." bounce check-in (docs/architecture/bounce-check-in.md). Default OFF: it is a
+     * notification nobody asked for until they switch it on.
+     *
+     * `distinctUntilChanged` for the same reason as [isGlobalEnabled]: the accessibility service
+     * collects this, and DataStore re-emits on every write to any key.
+     *
+     * Carried by a backup with the other settings. It is not a protection setting, so importing it
+     * is not weakening and needs no gate; a restore that turns it on simply restores the nudge the
+     * user had already opted into.
+     */
+    val bounceCheckInEnabled: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.BOUNCE_CHECK_IN_ENABLED] ?: false }
+        .distinctUntilChanged()
+
+    suspend fun setBounceCheckInEnabled(enabled: Boolean) {
+        dataStore.edit { prefs -> prefs[Keys.BOUNCE_CHECK_IN_ENABLED] = enabled }
+    }
+
+    /**
+     * "Show the camera on block screens": off by default. When on, every block screen draws the
+     * mirrored front-camera preview behind it. Only a picture, nothing is recorded, so it is not a
+     * protection setting: importing it is never weakening and needs no gate (same as
+     * [bounceCheckInEnabled]).
+     */
+    val cameraOnBlockScreens: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.CAMERA_ON_BLOCK_SCREENS] ?: false }
+        .distinctUntilChanged()
+
+    suspend fun setCameraOnBlockScreens(enabled: Boolean) {
+        dataStore.edit { prefs -> prefs[Keys.CAMERA_ON_BLOCK_SCREENS] = enabled }
+    }
+
+    /**
+     * The whole-phone pause (issue #123): off by default, a threshold in minutes and the length of
+     * the first pause. Not a protection setting, so neither direction is gated by Strict Mode.
+     * Carried by a backup with the other settings.
+     */
+    val phoneNudgeEnabled: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.PHONE_NUDGE_ENABLED] ?: false }
+        .distinctUntilChanged()
+
+    val phoneNudgeThresholdMinutes: Flow<Int> = dataStore.data
+        .map {
+            (it[Keys.PHONE_NUDGE_THRESHOLD_MINUTES] ?: PhoneNudge.DEFAULT_THRESHOLD_MINUTES)
+                .coerceIn(PhoneNudge.MIN_THRESHOLD_MINUTES, PhoneNudge.MAX_THRESHOLD_MINUTES)
+        }
+        .distinctUntilChanged()
+
+    val phoneNudgePauseSeconds: Flow<Int> = dataStore.data
+        .map {
+            (it[Keys.PHONE_NUDGE_PAUSE_SECONDS] ?: PhoneNudge.DEFAULT_FIRST_PAUSE_SECONDS)
+                .coerceIn(PhoneNudge.MIN_PAUSE_SECONDS, PhoneNudge.MAX_PAUSE_SECONDS)
+        }
+        .distinctUntilChanged()
+
+    suspend fun setPhoneNudgeEnabled(enabled: Boolean) {
+        dataStore.edit { prefs -> prefs[Keys.PHONE_NUDGE_ENABLED] = enabled }
+    }
+
+    suspend fun setPhoneNudgeThresholdMinutes(minutes: Int) {
+        dataStore.edit { prefs ->
+            prefs[Keys.PHONE_NUDGE_THRESHOLD_MINUTES] = minutes.coerceIn(
+                PhoneNudge.MIN_THRESHOLD_MINUTES,
+                PhoneNudge.MAX_THRESHOLD_MINUTES
+            )
+        }
+    }
+
+    suspend fun setPhoneNudgePauseSeconds(seconds: Int) {
+        dataStore.edit { prefs ->
+            prefs[Keys.PHONE_NUDGE_PAUSE_SECONDS] = seconds.coerceIn(
+                PhoneNudge.MIN_PAUSE_SECONDS,
+                PhoneNudge.MAX_PAUSE_SECONDS
+            )
+        }
+    }
+
+    /**
+     * Serialized emergency-pass usage ledger (`pkg=epochMillis;…`), holding the pass's last use for
+     * the rolling 24h GLOBAL lockout. Empty string = never used. A legacy per-app ledger migrates
+     * transparently — [com.astraedus.nudge.domain.emergency.EmergencyPass.globalLastUsed] reads the
+     * MAX timestamp across entries. A fresh use collapses it to the single global entry.
+     */
+    val emergencyPassUsage: Flow<String> = dataStore.data
+        .map { prefs -> prefs[Keys.EMERGENCY_PASS_USAGE] ?: "" }
+
+    suspend fun setEmergencyPassUsage(raw: String) {
+        dataStore.edit { prefs ->
+            prefs[Keys.EMERGENCY_PASS_USAGE] = raw
+        }
+    }
+
+    /**
+     * Record that the emergency pass was used at [now]. The lockout is GLOBAL (across every app), so
+     * this overwrites the ledger with a single global entry — no read-modify-merge needed.
+     */
+    suspend fun recordEmergencyPassUsed(now: Long) {
+        setEmergencyPassUsage(
+            com.astraedus.nudge.domain.emergency.EmergencyPass.serialize(
+                com.astraedus.nudge.domain.emergency.EmergencyPass.recordGlobal(now)
+            )
+        )
+    }
+
+    /**
+     * Serialized `;`-separated set of packages we have already shown the picture-in-picture escape
+     * explainer for (issue #19). Empty string = none. Parsed via
+     * [com.astraedus.nudge.domain.pip.PipEscapeLedger.parse].
+     *
+     * The explainer is one-shot education about a platform limitation Nudge cannot fix in code, so
+     * this exists purely to stop it nagging.
+     */
+    val pipEscapePromptedPackages: Flow<String> = dataStore.data
+        .map { prefs -> prefs[Keys.PIP_ESCAPE_PROMPTED] ?: "" }
+
+    /**
+     * Record that the PiP escape explainer has been shown for [packageName]. Read-modify-write under
+     * a single `edit` so two apps escaping close together cannot clobber each other's entry.
+     */
+    suspend fun recordPipEscapePrompted(packageName: String) {
+        dataStore.edit { prefs ->
+            val current = com.astraedus.nudge.domain.pip.PipEscapeLedger.parse(
+                prefs[Keys.PIP_ESCAPE_PROMPTED] ?: ""
+            )
+            prefs[Keys.PIP_ESCAPE_PROMPTED] = com.astraedus.nudge.domain.pip.PipEscapeLedger.serialize(
+                com.astraedus.nudge.domain.pip.PipEscapeLedger.record(current, packageName)
+            )
+        }
+    }
+
+    // --- Protection watchdog state (see [com.astraedus.nudge.domain.health.ProtectionWatchdog]) ---
+
+    /**
+     * Whether the last watchdog run found protection degraded. Persisted rather than kept in
+     * memory on purpose: the failure this exists for is the OS killing our process, so the very
+     * state the next run needs is the state a field would have lost.
+     */
+    val protectionDegraded: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.PROTECTION_DEGRADED] ?: false }
+
+    /** Epoch millis of the last protection alert we posted; 0 = never. Backs the alert cooldown. */
+    val protectionAlertShownAt: Flow<Long> = dataStore.data
+        .map { prefs -> prefs[Keys.PROTECTION_ALERT_SHOWN_AT] ?: 0L }
+
+    /**
+     * Records one watchdog verdict. Both values are written under a single `edit` because they are
+     * read together as one snapshot — a run that recorded "degraded" but lost the alert timestamp
+     * would re-alert on the next run and burn through the cooldown the user is being spared.
+     */
+    suspend fun recordProtectionCheck(degraded: Boolean, alertShownAtMs: Long?) {
+        dataStore.edit { prefs ->
+            prefs[Keys.PROTECTION_DEGRADED] = degraded
+            alertShownAtMs?.let { prefs[Keys.PROTECTION_ALERT_SHOWN_AT] = it }
+        }
+    }
+
+    // --- Nuke Mode (see docs/architecture/nuke-mode.md) ---------------------------------------
+    //
+    // These are DUMB writes. Every gate (what weakens Nuke, what needs the key or the emergency
+    // code) lives in `NukePolicy` and is applied by the ViewModels before they get here, the same
+    // split Strict Mode uses. The ONE invariant enforced here is the one no caller may break:
+    // Nuke is never on without a key, because a key is one of its only two ways out.
+
+    /**
+     * The whole persisted Nuke state as one value. `distinctUntilChanged` for the reason
+     * [isGlobalEnabled] documents: the accessibility service collects this, and DataStore re-emits
+     * every snapshot on every write to ANY key.
+     */
+    val nukeState: Flow<NukeState> = dataStore.data
+        .map { prefs ->
+            val hash = prefs[Keys.NUKE_KEY_HASH]?.takeIf { it.isNotBlank() }
+            val active = (prefs[Keys.NUKE_ACTIVE] ?: false) && hash != null
+            NukeState(
+                active = active,
+                packages = prefs[Keys.NUKE_PACKAGES] ?: emptySet(),
+                keyHash = hash,
+                keyKind = NukeKeyKind.fromNameOrNull(prefs[Keys.NUKE_KEY_KIND]),
+                // A timer only means anything while Nuke is on. Absent keys (every phone upgrading
+                // from before #184) and corrupt ones read as no timer.
+                timer = if (active) readNukeTimer(prefs) else null
+            )
+        }
+        .distinctUntilChanged()
+
+    private fun readNukeTimer(prefs: Preferences): NukeTimer? = NukeTimer.fromStored(
+        durationMs = prefs[Keys.NUKE_TIMER_DURATION_MS],
+        consumedMs = prefs[Keys.NUKE_TIMER_CONSUMED_MS],
+        bootCount = prefs[Keys.NUKE_TIMER_BOOT_COUNT],
+        segmentStartElapsedMs = prefs[Keys.NUKE_TIMER_SEGMENT_START_MS]
+    )
+
+    private fun writeNukeTimer(prefs: MutablePreferences, timer: NukeTimer?) {
+        if (timer == null) {
+            prefs.remove(Keys.NUKE_TIMER_DURATION_MS)
+            prefs.remove(Keys.NUKE_TIMER_CONSUMED_MS)
+            prefs.remove(Keys.NUKE_TIMER_BOOT_COUNT)
+            prefs.remove(Keys.NUKE_TIMER_SEGMENT_START_MS)
+            return
+        }
+        prefs[Keys.NUKE_TIMER_DURATION_MS] = timer.durationMs
+        prefs[Keys.NUKE_TIMER_CONSUMED_MS] = timer.consumedMs
+        timer.bootCount?.let { prefs[Keys.NUKE_TIMER_BOOT_COUNT] = it } ?: prefs.remove(Keys.NUKE_TIMER_BOOT_COUNT)
+        prefs[Keys.NUKE_TIMER_SEGMENT_START_MS] = timer.segmentStartElapsedMs
+    }
+
+    /**
+     * Turn Nuke on (with no timer) or off. Refuses to turn it ON with no key paired (it stays off).
+     * Turning it OFF also clears its timer, in the same transaction: ending Nuke ends the timer.
+     */
+    suspend fun setNukeActive(active: Boolean) {
+        if (active) {
+            armNuke(timer = null)
+            return
+        }
+        dataStore.edit { prefs ->
+            prefs[Keys.NUKE_ACTIVE] = false
+            writeNukeTimer(prefs, null)
+        }
+    }
+
+    /**
+     * Turn Nuke ON, with [timer] or none, in one transaction. Still never on without a key. Arming a
+     * Nuke that is ALREADY on changes nothing: in particular it can never replace a running timer
+     * with a shorter one (or none), which would be a way around the timer.
+     */
+    suspend fun armNuke(timer: NukeTimer?) {
+        dataStore.edit { prefs ->
+            if (prefs[Keys.NUKE_KEY_HASH].isNullOrBlank()) {
+                prefs[Keys.NUKE_ACTIVE] = false
+                return@edit
+            }
+            if (prefs[Keys.NUKE_ACTIVE] == true) return@edit
+            prefs[Keys.NUKE_ACTIVE] = true
+            writeNukeTimer(prefs, timer)
+        }
+    }
+
+    /**
+     * Fold the running timer's segment into its stored count (see [NukeTimer.checkpoint]), so a crash
+     * or a hard power-off loses at most the time since now. A no-op with no timer running.
+     */
+    suspend fun checkpointNukeTimer(now: NukeClockReading) {
+        dataStore.edit { prefs ->
+            if (prefs[Keys.NUKE_ACTIVE] != true) return@edit
+            val timer = readNukeTimer(prefs) ?: return@edit
+            writeNukeTimer(prefs, timer.checkpoint(now))
+        }
+    }
+
+    /** The timer picker's last choice in minutes, 0 for none. Remembered so a routine is one tap. */
+    val nukeTimerChoiceMinutes: Flow<Int> = dataStore.data
+        .map { prefs -> NukeTimer.choiceOrNone(prefs[Keys.NUKE_TIMER_CHOICE_MINUTES]) }
+        .distinctUntilChanged()
+
+    suspend fun setNukeTimerChoice(minutes: Int) {
+        dataStore.edit { prefs -> prefs[Keys.NUKE_TIMER_CHOICE_MINUTES] = NukeTimer.choiceOrNone(minutes) }
+    }
+
+    /** Saved Nuke profiles (#183), in the order saved. A corrupt value reads as none, never a crash. */
+    val nukeProfiles: Flow<List<NukeProfile>> = dataStore.data
+        .map { prefs -> NukeProfilesCodec.decode(prefs[Keys.NUKE_PROFILES]) }
+        .distinctUntilChanged()
+
+    /**
+     * Apply [edit] to the saved profiles under one `edit`, and store the result when it is
+     * [NukeProfiles.Edit.Done]. Touches ONLY the profiles key: no profile write can reach the
+     * working list or a running Nuke.
+     */
+    suspend fun editNukeProfiles(edit: (List<NukeProfile>) -> NukeProfiles.Edit): NukeProfiles.Edit {
+        var result: NukeProfiles.Edit = NukeProfiles.Edit.Refused(NukeProfiles.Refusal.NOT_FOUND)
+        dataStore.edit { prefs ->
+            result = edit(NukeProfilesCodec.decode(prefs[Keys.NUKE_PROFILES]))
+            val done = result as? NukeProfiles.Edit.Done ?: return@edit
+            prefs[Keys.NUKE_PROFILES] = NukeProfilesCodec.encode(done.profiles)
+        }
+        return result
+    }
+
+    /**
+     * Replace the working list with [packages] (applying a profile), but ONLY while Nuke is off:
+     * swapping the list of a running Nuke could take apps off it, which is weakening. The check is
+     * inside the same transaction as the write, so a Nuke started a moment earlier is never touched.
+     *
+     * @return true when the list was replaced.
+     */
+    suspend fun replaceNukePackagesWhileOff(packages: Set<String>): Boolean {
+        var replaced = false
+        dataStore.edit { prefs ->
+            val active = prefs[Keys.NUKE_ACTIVE] == true && !prefs[Keys.NUKE_KEY_HASH].isNullOrBlank()
+            if (active) return@edit
+            prefs[Keys.NUKE_PACKAGES] = packages.filterTo(mutableSetOf()) { it.isNotBlank() }
+            replaced = true
+        }
+        return replaced
+    }
+
+    /** Add [packages] to the Nuke list. Read-modify-write under one `edit`. */
+    suspend fun addNukePackages(packages: Collection<String>) {
+        dataStore.edit { prefs ->
+            prefs[Keys.NUKE_PACKAGES] = (prefs[Keys.NUKE_PACKAGES] ?: emptySet()) +
+                packages.filter { it.isNotBlank() }
+        }
+    }
+
+    /** Remove [packages] from the Nuke list. Read-modify-write under one `edit`. */
+    suspend fun removeNukePackages(packages: Collection<String>) {
+        dataStore.edit { prefs ->
+            prefs[Keys.NUKE_PACKAGES] = (prefs[Keys.NUKE_PACKAGES] ?: emptySet()) - packages.toSet()
+        }
+    }
+
+    /** Pair a key: only its hash is stored, never the payload. */
+    suspend fun setNukeKey(keyHash: String, kind: NukeKeyKind) {
+        require(keyHash.isNotBlank()) { "a Nuke key hash must not be blank" }
+        dataStore.edit { prefs ->
+            prefs[Keys.NUKE_KEY_HASH] = keyHash
+            prefs[Keys.NUKE_KEY_KIND] = kind.name
+        }
+    }
+
+    /** Unpair the key. Also turns Nuke OFF, in the same transaction: no key, no Nuke. */
+    suspend fun clearNukeKey() {
+        dataStore.edit { prefs ->
+            prefs.remove(Keys.NUKE_KEY_HASH)
+            prefs.remove(Keys.NUKE_KEY_KIND)
+            prefs[Keys.NUKE_ACTIVE] = false
+            writeNukeTimer(prefs, null)
+        }
+    }
+
+    /** Whether the one-time Nuke explainer has been shown. */
+    val nukeIntroSeen: Flow<Boolean> = dataStore.data
+        .map { prefs -> prefs[Keys.NUKE_INTRO_SEEN] ?: false }
+        .distinctUntilChanged()
+
+    suspend fun setNukeIntroSeen() {
+        dataStore.edit { prefs -> prefs[Keys.NUKE_INTRO_SEEN] = true }
+    }
+
+    /**
+     * The redirect app: the one app offered on every block screen instead of the blocked one, or
+     * null when none is chosen. Storage rules live in [RedirectAppPref]; WHETHER a saved package may
+     * be shown is `RedirectAppPolicy.resolve`'s decision, never this raw value's. Device-local, not
+     * exported.
+     */
+    val redirectAppPackage: Flow<String?> = dataStore.data
+        .map { prefs -> RedirectAppPref.read(prefs) }
+        .distinctUntilChanged()
+
+    /** Choose [packageName] as the redirect app, or clear it with null. */
+    suspend fun setRedirectAppPackage(packageName: String?) {
+        dataStore.edit { prefs -> RedirectAppPref.write(prefs, packageName) }
+    }
+
+    // --- First-unlock schedules (spec 5.1, PR 5b) ------------------------------------------
+
+    /**
+     * The hour the logical day starts, in minutes from midnight. Default 240 = 4:00 AM, so a 2:00 AM
+     * unlock still belongs to the evening before (spec 3.5).
+     *
+     * ONE setting for the whole app, because there is only one "first unlock of the day". It is
+     * edited where first-unlock rules are made (the "New day starts at" row), not in Settings.
+     *
+     * `distinctUntilChanged` for the same reason as [isGlobalEnabled]: the service collects this and
+     * DataStore re-emits on every write to any key.
+     */
+    val dayStartMinute: Flow<Int> = dataStore.data
+        .map { prefs -> prefs[Keys.DAY_START_MINUTE] ?: FirstUnlockWindow.DEFAULT_DAY_START_MINUTE }
+        .distinctUntilChanged()
+
+    suspend fun setDayStartMinute(minute: Int) {
+        dataStore.edit { prefs -> prefs[Keys.DAY_START_MINUTE] = minute }
+    }
+
+    /**
+     * Wall-clock ms of the first unlock of the current logical day, or 0 for "none yet".
+     *
+     * Written by the accessibility service on `ACTION_USER_PRESENT` (or the app-window fallback) and
+     * read only through `FirstUnlockStateCache`, which keeps it in memory for the event path. Device
+     * local on purpose: it describes this phone's morning, so an export neither carries it nor
+     * restores it (spec 5.8). Including it would let a backup from another timezone claim a window
+     * the user never unlocked into.
+     */
+    val firstUnlockAt: Flow<Long> = dataStore.data
+        .map { prefs -> prefs[Keys.FIRST_UNLOCK_AT] ?: FirstUnlockWindow.NO_STAMP }
+        .distinctUntilChanged()
+
+    suspend fun setFirstUnlockAt(stampMs: Long) {
+        dataStore.edit { prefs -> prefs[Keys.FIRST_UNLOCK_AT] = stampMs }
+    }
+
+    /**
+     * Keep or set the day's first-unlock stamp, as ONE atomic read-compare-write (spec 5.3).
+     *
+     * Read-then-write was the first shape and review caught what it costs: `FirstUnlockStateCache`
+     * starts at [FirstUnlockWindow.NO_STAMP] and only learns the stored value once DataStore emits,
+     * so the first unlock after a process restart (a Play update, a crash, the system killing the
+     * service) compared against `0`, wrote `now`, and opened a surprise mid-afternoon window. Two
+     * recorders in the same moment could also both decide to write. Doing the comparison inside
+     * `edit` means the decision sees the stored stamp always, and DataStore's serialised writes make
+     * it a single step.
+     *
+     * Returns what is now stored plus which of the two happened, so the caller can log it and heal
+     * its in-memory copy without a second read.
+     */
+    suspend fun recordFirstUnlock(
+        nowMs: Long,
+        zone: java.time.ZoneId = java.time.ZoneId.systemDefault()
+    ): FirstUnlockStamp {
+        var result = FirstUnlockStamp(
+            stampMs = FirstUnlockWindow.NO_STAMP,
+            dayStartMinute = FirstUnlockWindow.DEFAULT_DAY_START_MINUTE,
+            written = false
+        )
+        dataStore.edit { prefs ->
+            val dayStart = prefs[Keys.DAY_START_MINUTE]
+                ?: FirstUnlockWindow.DEFAULT_DAY_START_MINUTE
+            val current = prefs[Keys.FIRST_UNLOCK_AT] ?: FirstUnlockWindow.NO_STAMP
+            result = if (FirstUnlockWindow.shouldStamp(nowMs, current, dayStart, zone)) {
+                prefs[Keys.FIRST_UNLOCK_AT] = nowMs
+                FirstUnlockStamp(stampMs = nowMs, dayStartMinute = dayStart, written = true)
+            } else {
+                FirstUnlockStamp(stampMs = current, dayStartMinute = dayStart, written = false)
+            }
+        }
+        return result
+    }
+
+    // --- Backup: the settings an export file carries (see [ExportedSettings]) ---------------
+
+    /**
+     * The current value of every setting a backup carries.
+     *
+     * Read through the public Flows above rather than off one raw `Preferences` snapshot, on
+     * purpose: those Flows are where each setting's DEFAULT lives, and a second hand-written copy
+     * of "`emergencyPassEnabled` defaults to true" here would eventually disagree with them —
+     * exporting a value the app never actually used. The cached reads on a user-initiated,
+     * already-off-main export are a trade worth making for that.
+     */
+    suspend fun exportableSettings(): ExportedSettings = ExportedSettings(
+        contentFilterEnabled = contentFilterEnabled.first(),
+        contentFilterMode = contentFilterMode.first(),
+        contentFilterStrictKeywords = contentFilterStrictKeywords.first(),
+        contentFilterAllowlist = contentFilterAllowlist.first().sorted(),
+        contentFilterBlocklist = contentFilterBlocklist.first().sorted(),
+        strictModeEnabled = isStrictModeEnabled.first(),
+        strictModeChallengeLength = strictModeChallengeLength.first(),
+        emergencyPassEnabled = emergencyPassEnabled.first(),
+        bounceCheckInEnabled = bounceCheckInEnabled.first(),
+        cameraOnBlockScreens = cameraOnBlockScreens.first(),
+        phoneNudgeEnabled = phoneNudgeEnabled.first(),
+        phoneNudgeThresholdMinutes = phoneNudgeThresholdMinutes.first(),
+        phoneNudgePauseSeconds = phoneNudgePauseSeconds.first(),
+        customDelayTitles = customDelayTitles.first(),
+        customDelaySubtitles = customDelaySubtitles.first(),
+        customHardBlockMessages = customHardBlockMessages.first(),
+        dayStartMinute = dayStartMinute.first()
+    )
+
+    /**
+     * Applies an imported backup's settings.
+     *
+     * ALL-OR-NOTHING: every key is written inside ONE `edit` block, which DataStore commits as a
+     * single transaction. A half-applied restore is the shape to avoid here — landing
+     * `strictModeEnabled = false` but not the challenge length that came with it leaves the user in
+     * a state their backup never described, on the app's protection settings.
+     *
+     * A null field is SKIPPED, not written: the file does not carry that setting, so this device's
+     * own value stands. That is what lets a backup from a future Nudge (or a hand-edited partial
+     * file) restore what it does carry without blanking what it does not.
+     */
+    suspend fun applyImportedSettings(settings: ExportedSettings) {
+        if (settings.isEmpty) return
+        dataStore.edit { prefs ->
+            settings.contentFilterEnabled?.let { prefs[Keys.CONTENT_FILTER_ENABLED] = it }
+            settings.contentFilterMode?.let { prefs[Keys.CONTENT_FILTER_MODE] = it }
+            settings.contentFilterStrictKeywords?.let {
+                prefs[Keys.CONTENT_FILTER_STRICT_KEYWORDS] = it
+            }
+            // REPLACES this device's list, like every other setting a backup carries. An import
+            // that adds entries is weakening and was gated before this ran (ImportedSettingsWeakening).
+            settings.contentFilterAllowlist?.let {
+                prefs[Keys.CONTENT_FILTER_ALLOWLIST] = ContentFilterUserList.canonicalize(it).toSet()
+            }
+            // REPLACES this device's list. An import that REMOVES blocks is weakening and was gated
+            // before this ran (ImportedSettingsWeakening).
+            settings.contentFilterBlocklist?.let {
+                prefs[Keys.CONTENT_FILTER_BLOCKLIST] = ContentFilterUserList.canonicalize(it).toSet()
+            }
+            settings.strictModeEnabled?.let { prefs[Keys.STRICT_MODE_ENABLED] = it }
+            settings.strictModeChallengeLength?.let {
+                prefs[Keys.STRICT_MODE_CHALLENGE_LENGTH] = it
+            }
+            settings.emergencyPassEnabled?.let { prefs[Keys.EMERGENCY_PASS_ENABLED] = it }
+            settings.bounceCheckInEnabled?.let { prefs[Keys.BOUNCE_CHECK_IN_ENABLED] = it }
+            settings.cameraOnBlockScreens?.let { prefs[Keys.CAMERA_ON_BLOCK_SCREENS] = it }
+            settings.phoneNudgeEnabled?.let { prefs[Keys.PHONE_NUDGE_ENABLED] = it }
+            settings.phoneNudgeThresholdMinutes?.let {
+                prefs[Keys.PHONE_NUDGE_THRESHOLD_MINUTES] = it
+            }
+            settings.phoneNudgePauseSeconds?.let { prefs[Keys.PHONE_NUDGE_PAUSE_SECONDS] = it }
+            settings.customDelayTitles?.let { prefs[Keys.CUSTOM_DELAY_TITLES] = it }
+            settings.customDelaySubtitles?.let { prefs[Keys.CUSTOM_DELAY_SUBTITLES] = it }
+            settings.customHardBlockMessages?.let { prefs[Keys.CUSTOM_HARD_BLOCK_MESSAGES] = it }
+            // A backup restores the day the user had, not this phone's. Import is gated when an
+            // enabled first-unlock rule exists (ImportedSettingsWeakening).
+            settings.dayStartMinute?.let { prefs[Keys.DAY_START_MINUTE] = it }
+        }
+    }
+}
+
+/**
+ * The outcome of [NudgePreferences.recordFirstUnlock]: the stamp now stored, the day start it was
+ * judged against, and whether this call wrote it.
+ */
+data class FirstUnlockStamp(
+    val stampMs: Long,
+    val dayStartMinute: Int,
+    val written: Boolean
+)

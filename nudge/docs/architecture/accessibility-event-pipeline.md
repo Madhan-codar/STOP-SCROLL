@@ -1,0 +1,656 @@
+# The accessibility event pipeline: one classification, one sitting, one counter
+
+What happens to an accessibility event between `onAccessibilityEvent` and a decision, why it is
+shaped this way, and how to turn the next bug report into a failing test before writing a fix.
+**Read before touching `NudgeAccessibilityService.onAccessibilityEvent`, `EventClassifier`,
+`SittingTracker`, `InteractionCounter`, `InteractionHandler`, or `PassthroughManager`.**
+
+Companion docs: `foreground-detection.md` (the history of what "the user is in app P" has meant) and
+`counter-overlay-and-autokick.md` (what the counter feeds).
+
+## The bug family this exists to end
+
+Five reports, five fixes, one shape:
+
+| Issue | Symptom | What was actually wrong |
+|---|---|---|
+| [#5](https://github.com/astraedus/nudge/issues/5) | keyboard re-blocks the app | a keyboard's window event reached the passthrough clear |
+| Home path (v1.13) | the delay never re-armed after Home | the `SYSTEM_PACKAGES` return fired ~200 lines before the clear |
+| [#7](https://github.com/astraedus/nudge/issues/7) | timer does not start on re-entry | a content-change-only re-entry returned before evaluation |
+| [#19](https://github.com/astraedus/nudge/issues/19) | 9 re-blocks in 5 minutes from a PiP bubble | the gate was attached to one branch instead of the pipeline |
+| [#28](https://github.com/astraedus/nudge/issues/28) | a picker re-blocks the app; the counter lies | any foreign package's event reached the passthrough clear |
+| [#41](https://github.com/astraedus/nudge/issues/41) | a daily limit stops blocking while our own counter is up | OUR OWN overlay's event was read as "Nudge is in front" |
+
+Every one of them was an **ordering** bug, not a logic bug, and every fix was a new hardcoded set or
+a new early return in a method that derived "what is on screen" independently in six places. That
+structure guarantees a sixth report. The pipeline below removes the structure, not just the fifth
+bug.
+
+## The shape
+
+```
+AccessibilityEvent  (framework object, android.*)
+  |
+  |  AccessibilityEventRecordFactory.toRecord()        <- the ONLY place that reads a live event
+  v
+AccessibilityEventRecord  (pure data, no android imports, serialisable)
+  |
+  |-- AccessibilityEventTrace.record()                 <- debug builds: one JSON line to logcat
+  |
+  |  EventClassifier.classify()                        <- ONE answer to "what is on screen?"
+  v
+ForegroundSignal   AppWindow | Home | SystemSurface | OwnUi | AwarenessOverlay
+                   | Transient | PipOnly | NotForeground
+  |
+  |  PassthroughManager.onForegroundSignal()  ->  SittingTracker
+  v
+SittingEvent       Unchanged | Started | Ended(WENT_HOME | SCREEN_OFF | ANOTHER_APP_HELD_FOREGROUND)
+  |
+  |  ...then the existing dispatch: block evaluation, overlays, web domains, auto-kick
+  v
+InteractionCounter (for VIEW_SCROLLED / VIEW_CLICKED)  ->  CountResult(count, mode)
+```
+
+Two rules hold the whole thing together, and both are pinned by `EventDispatchOrderContractTest`
+because neither is visible to a value-level test:
+
+1. **Classify once, above every early return.** `onAccessibilityEvent` may return before the
+   classification for exactly three reasons, all of them "there is nothing to classify": a null
+   event, a null package, and the PiP-explainer modal.
+2. **Update the sitting once, immediately after.** This is only safe — and it is what makes a sixth
+   bug of this family unavailable — because `SittingTracker` makes every signal except `AppWindow`
+   and `Home` *structurally* incapable of ending a sitting. There is nothing below the update that a
+   future early return could skip.
+
+Everything downstream reads the signal. Re-deriving `packageName in SYSTEM_PACKAGES` inside a branch
+is how the Pixel's `com.google.android.permissioncontroller` came to be classified two different
+ways in one file; the contract test now forbids it by name.
+
+## Our own windows are three different things ([#41](https://github.com/astraedus/nudge/issues/41), [#33](https://github.com/astraedus/nudge/issues/33))
+
+> Read this before touching anything that asks "is this Nudge?".
+
+Nudge emits four shapes of window event under one package name, and they do not mean the same thing:
+
+| What it is | Class name it carries | What it means about where the user is |
+|---|---|---|
+| The main app | `com.astraedus.nudge.MainActivity` | the user is **in Nudge**; they left whatever they were in |
+| The block overlay | `com.astraedus.nudge.ui.overlay.BlockOverlayActivity` | Nudge is **in front of** the user |
+| The overlay TASK's first window | `android.widget.FrameLayout` | nothing yet — it arrives ~600ms before the overlay itself |
+| An awareness overlay | `com.astraedus.nudge.service.AwarenessOverlayWindow` | Nudge drew **on top of** the app the user never left |
+
+For three releases all four were `ForegroundSignal.OwnUi`, and `BlockLaunchGate.foregroundAfter`
+moves the foreground to Nudge for `OwnUi`. For the first two that is deliberate and is half of
+issue #31's fix. For the last it is the bug.
+
+**#41, measured.** Bench Pixel 3, v1.17.1, scenario S3 of the #36 investigation: Hard Block plus a
+1-minute daily limit on Keep, the limit exceeded, Keep visibly in front. Every 30 seconds:
+
+```
+block overlay launch dropped target=com.google.android.keep attributed=com.google.android.keep
+  reason=DROP_FOREGROUND_MOVED foreground=dev.astraedus.nudge
+```
+
+The interaction counter and the time-remaining pill are `TYPE_ACCESSIBILITY_OVERLAY` windows we
+own, so adding one — or setting a `TextView`'s text inside one — emits an event carrying
+our package. The foreground moved to Nudge and **nothing moved it back**, because a user sitting
+still in an app fires no window event for the app they are already in. Every subsequent tick was
+refused. It self-corrected on the next real Keep window event, which on a phone left face-up is
+indefinitely, and in the meantime someone past their daily limit was not being blocked.
+
+**The fix is a separate signal, identified positively.** `ForegroundSignal.AwarenessOverlay`
+carries no foreground claim, ends no walk-away, no arrival and no storm, and moves no sitting: it
+sits with `SystemSurface` and `Transient` in every exhaustive `when`. It is recognised by the
+accessibility class name the overlay's views report — never as "Nudge and not the block
+overlay", because the framework class name on row three of that table is what a negative test
+misfiles, which is the same reason `BlockLaunchGate.isOwnMainAppWindow` is positive (see
+`block-overlay-lifecycle.md`, issue #36).
+
+Two details that are load-bearing rather than tidy:
+
+- **Every view in an awareness overlay wears the identity, not just the root.** A
+  `TYPE_WINDOW_CONTENT_CHANGED` is sourced from the view that changed, or from their common
+  ancestor once `ViewRootImpl` coalesces a burst. Our own package is classified *ahead of* the
+  window-change test, so content changes reach `foregroundAfter` too — identifying only the
+  root would leave the counter's own text updates claiming the foreground on every interaction it
+  counts.
+- **`EventClassifier`'s `awarenessOverlayClassNames` has no default.** A forgotten argument would
+  not fail; it would silently reclassify both overlays as `OwnUi` with the whole suite green.
+
+`AwarenessOverlayContractTest` DISCOVERS the rule rather than listing it: any framework widget
+constructed in either overlay manager fails it, including one nobody has added yet. Verified by
+reverting one view to a bare `TextView`.
+
+**#33, the same question asked one field over.** `NudgeAccessibilityService.shouldClearForOwnPackageEvent`
+tested `className.startsWith(ownPackageName)` where `ownPackageName` was the **applicationId**:
+
+| | value | appears as |
+|---|---|---|
+| `applicationId` | `dev.astraedus.nudge` | `event.packageName` |
+| `namespace` | `com.astraedus.nudge` | `event.className`, every class we ship |
+
+The prefix is therefore false for every event this app can emit, so `clearOverlays(packageName,
+"own_app_window")` was dead in production for months — the awareness overlays stopped hiding
+when the user opened Nudge. **Its three unit tests passed throughout**, because they built the
+predicate's constant out of the literal `"com.astraedus.nudge"` and fed it the same literal back.
+`tasks/lessons.md` (2026-09-14) records the general form: *a test that supplies its own value for a
+production constant cannot see that the production value breaks the predicate.*
+
+"Is this class ours" is now ONE predicate, `BlockLaunchGate.isOwnNudgeClass`, shared with
+`isOwnMainAppWindow`; the service derives the namespace from a real class
+(`BuildConfig::class.java.packageName`) rather than naming it; and `NudgeIdentity` gives the test
+tree one derived source for both identities, with `OwnClassNamespaceContractTest` asserting they
+are **different strings**. Four suites had been feeding the namespace in as the app's package;
+they now read the real values. The restored clear cannot double-fire on the overlays themselves:
+they classify as `AwarenessOverlay` and return above the `OwnUi` branch, so a pill can no longer
+order itself hidden.
+
+## The window, not only the package ([#76](https://github.com/astraedus/nudge/issues/76), [#71](https://github.com/astraedus/nudge/issues/71))
+
+> Read before touching `EventClassifier`, `WindowSnapshot`, `WindowSnapshotReader`,
+> `FloatingWindowCover*`, or the overlay-bypass branch of `onAccessibilityEvent`.
+
+Until 1.21 every answer the classifier gave was about the event's PACKAGE: "an event carrying P means
+the user is in P". Picture-in-picture (#19) was the first counter-example and got a one-off window
+probe. Two more arrived together:
+
+| Issue | Device | What the package said | What the window list said |
+|---|---|---|---|
+| #76 | S24 Ultra, Android 16, SwiftKey | a foreign app came forward, start the away clock | a panel drawn in or beside the KEYBOARD (inline autofill, clipboard, writing tools), with Instagram still focused |
+| #71 | Huawei, Android 10 | the blocked app is back in front, the overlay was bypassed | a NON-fullscreen (freeform) window stacked ABOVE our fullscreen overlay |
+
+In #76 two minutes of typing (IME events, transient, so nothing cancelled the clock) followed by
+closing the keyboard read as a return from a two-minute absence: grant revoked, block, and repeated
+blocks walked into the auto-kick cooldown. In #71 every touch relaunched the overlay underneath the
+floating window, forever, and the floating app stayed usable.
+
+**One read.** `WindowSnapshotReader` turns `getWindows()` into a pure `domain/windows/WindowSnapshot`
+(kind, owner for application windows only, active, focused, PiP, bounds, display size), caching each
+window's owner by id so the steady state is one binder call per read. It is read on every
+`TYPE_WINDOW_STATE_CHANGED` (the platform recomputes the list right before dispatching one; verified in
+the android10-release `AccessibilityManagerService`) and, throttled with one trailing read, on
+`TYPE_WINDOWS_CHANGED`, including the null-package ones the dispatch drops. PiP derives from the same
+read, so there is no second reader to disagree with.
+
+**The classifier demotes a would-be `AppWindow(P)` to `Transient` on positive evidence only:** the
+event's window is a known non-application window; or P owns application windows, none active or
+focused, while another app's window is; or the keyboard is up, P owns no window at all and another
+app holds focus (an embedded inline-suggestion view is not a window of its own). No list, an unknown
+window id, or no application window holding focus all answer `AppWindow` exactly as before, because a
+wrong `Transient` is a block not evaluated. The one case that can misfile a brand-new app (keyboard
+still listed, its window not yet) costs one event: its next content change is evaluated through the
+issue #7 path. Every ENABLED keyboard is transient too, not only the default.
+
+**A floating window is never a bypass, and is blocked by a cover.** `BlockLaunchGate.isGenuineBypass`
+takes `floating` (no default at the guard). A floating window's event falls through to evaluation
+without dropping the overlay, and `launchBlockOverlay` (the one launch site, so rules, cooldowns,
+daily limits and web blocks all get it) covers a floating target with a touch-consuming
+`TYPE_ACCESSIBILITY_OVERLAY` over its bounds (`FloatingWindowCoverManager`, the tab cover's
+approach), presses BACK once per window while that window holds focus (before the overlay launches
+and takes focus, or BACK would read as a walk-away), and does not relaunch an overlay that is already
+up. The cover has a "Close window" button that presses BACK, because the OEM close handle is usually
+inside the window, under the cover. It follows the window, and comes off when the window closes or
+turns fullscreen, a grant or emergency pass exists, the decision becomes ALLOW, Nudge is disabled, or
+the screen goes off. Split-screen halves are non-fullscreen too and get the same treatment. PiP is
+excluded and keeps #19's handling.
+
+**What "bounds" is, and why the keyboard does not make an app look floating.** The region an
+`AccessibilityWindowInfo` reports is the window's OWN touchable region, not what is left visible after
+the windows above it: `AccessibilityController` uses the occlusion (`unaccountedSpace`) only to decide
+whether a window is listed at all, and `AccessibilityWindowManager` copies `regionInScreen` across
+unclipped (checked in the android10-release and android14-release sources). So an app with the keyboard
+over its lower half still reports its full frame and stays fullscreen. Two honest limits of the 85%
+rule: a letterboxed portrait-only app on a landscape tablet, and a dialog-themed activity that is the
+app's only window, both read as floating. Both still end up blocked (cover plus BACK instead of the
+overlay), which is the safe direction.
+
+**Floating means STAYED floating-sized ([#119](https://github.com/astraedus/nudge/issues/119)).** One
+window list cannot tell a floating window from a fullscreen app that is still animating into place. On
+a Pixel 9a (GrapheneOS, Android 17), Clock resumed from Recents was listed at 868x1949 on a 1080x2424
+display, 80% on both axes, 17ms before its scale-up finished; the platform's own task record had it
+fullscreen throughout. The single-list rule pressed BACK on it, that destroyed Clock's only activity,
+its task was removed, and when the Delay completed the overlay finished onto Home, which revoked the
+pass. The "safe direction" above is not safe for this case: BACK is destructive. No size threshold
+fixes it, because a launch animation passes through every scale. So every floating decision in the
+service now goes through `FloatingWindowSettle` (`floatingVerdictFor`):
+
+- `observe(snapshot, now)` runs on every window read, BEFORE the snapshot is published, and tracks per
+  package since when it has been floating-sized and since when at its current bounds.
+- `verdict` is `Settled` once the bounds have held still for `SETTLE_MS` (750ms), or the package has
+  been floating-sized for `MAX_WAIT_MS` (2.5s) even while moving, so a window being dragged is still
+  covered, later. 750ms is above the 500ms after which `AccessibilityWindowsPopulator` forces out a
+  list it was holding back during continuous change (the capture logs it), so a still list really is
+  a still window. A package already under the cover stays `Settled` while it moves.
+- At the launch site, `Unsettled` blocks the target as FULLSCREEN (the ordinary overlay, no BACK, no
+  cover) and records it in `pendingFloatingTarget`, with a forced window re-read when it would settle.
+  `confirmPendingFloating` answers it on every read: gone or fullscreen (#119: our overlay occluded
+  Clock and it left the list) ends it; `Settled` with the block still up and no grant adds the cover.
+- The bypass check uses the settled verdict too. A fullscreen app animating back in over a live overlay
+  is a bypass, as it was before #71.
+
+What this costs #71: a real floating window gets the ordinary overlay first and the cover up to 750ms
+later, and by then the overlay usually holds focus, so the BACK press is skipped (`backTarget` needs
+the floating window focused) and the cover alone blocks it. That is the same position as the known gap
+below, not a new one. A positive "something is behind it" signal (a floating window floats OVER another
+app's window) was considered and rejected: #71 left no window capture from the OEM devices it is for,
+and a guess there could switch the cover off where it is needed. `FloatingSettleContractTest` pins
+that the service never asks a single list (`isFloating(`, `coverFor(`, `floatingBoundsOf(` are absent).
+
+**A completed Delay hands back to its app ([#119](https://github.com/astraedus/nudge/issues/119),
+defence in depth).** If the overlay's `finish()` reveals Home instead of the app, for whatever reason
+the app's task was lost, the next Home signal would end the sitting as `WENT_HOME` and revoke the pass
+the user just waited for. `PassthroughManager.grant(completedAtMs = …)` (stamped by
+`BlockOverlayActivity` on timer completion, app grants only) arms `CompletionHandBack`; the first app
+or home signal after it decides. The app's own window, or any other app's, disarms it. Home within
+`WINDOW_MS` (1.5s; the capture measured 139ms from `finish()` to the launcher's Home) makes the
+service start the app's launcher intent (`handBackToCompletedApp`, `NEW_TASK | RESET_TASK_IF_NEEDED`,
+what the icon does) and that one Home is not applied to the sitting. If nothing could be started, the
+Home is applied as before. Deliberately NOT unconditional (a launcher intent on top of a deep-link-rooted
+task restarts the app at its splash screen), NOT for web blocks (the browser's launch intent is not
+the page), and NOT for the walk-away (#26: it grants nothing, so nothing arms; a new block launch also
+disarms). Strict Mode is not weakened: the hand-back can only open the app whose pass the user has
+just earned, never Settings, so even a guard's Home that lands inside the window takes the user to
+that app and out of the escape route, which is all the guard asks. Pinned by `CompletionHandBackTest` and `PassthroughHandBackTest`
+(through the real `SittingTracker`, with the counterfactual that the same stream without the stamp
+revokes as `WENT_HOME`).
+
+**Known gap: the "Close window" button.** BACK goes to the focused window. When the overlay was just
+launched it holds focus, so the first tap can read as a walk-away on the overlay instead of closing
+the floating window. Unverified on a device which window gets focus after that; Recents always
+removes a floating window. Device QA case 4 in the PR is what settles it.
+
+Pinned by `WindowSnapshotTest`, `FloatingWindowCoverTest`, `FloatingWindowSettleTest` (the #119
+window sequence replayed, with the counterfactual that the single-list rule presses BACK on the same
+frame), `WindowSnapshotReaderTest` and `WindowEvidenceTest` (which replays #76 through the real `SittingTracker`, with the counterfactual that
+the same stream without window evidence revokes the grant).
+
+## A window event that is not about a window: accessibility panes
+
+`TYPE_WINDOW_STATE_CHANGED` carries two different meanings. Usually it is a window (an activity, a
+dialog) coming forward. But the platform also sends it, in place of a content change, when a view
+that has an accessibility pane title appears, disappears or is retitled, with `contentChangeTypes`
+set to `CONTENT_CHANGE_TYPE_PANE_APPEARED` (0x10), `PANE_DISAPPEARED` (0x20) or `PANE_TITLE` (0x08).
+The framework doc for the type says so in as many words. A pane event says nothing about which app
+is in front.
+
+Before 1.24.0 the classifier read only the type, so a pane event was an `AppWindow`. YouTube is the
+one app on the bench that sends them: its player pane disappears when the user leaves, from a
+`android.view.ViewGroup` in a window that the live window list no longer contains. When that event
+arrived 30 to 60ms AFTER the launcher's Home signal, it started a new YouTube sitting, moved the
+block guard's foreground back to YouTube, and the Delay overlay launched over the home screen. When
+the countdown finished, the completion hand-back (above) correctly reopened YouTube. So a single Home
+press brought the app back. It reproduced on v1.23.2 as well. It looked like a flake because the
+straggler sometimes arrives BEFORE the Home signal, and then Home ends the sitting last and nothing
+restarts it. On the bench, 10 of 10 stragglers that arrived after Home made a phantom sitting
+before the fix. After it, 6 of 6 made none.
+
+`AccessibilityEventRecord.isPaneChange` (a window-state type whose `contentChangeTypes` has a pane
+bit) is classified `NotForeground` before every other check, the launcher included: a missed Home
+is a missed revoke, never a false re-block. The window evidence cannot save the old reading, because
+"window id absent from the list" means no evidence, not "not in front". The service's window branch
+then returns on `NotForeground` instead of evaluating the package. A real arrival always comes with
+its own activity event (`contentChangeTypes` 0), and YouTube's content changes still drive feature
+detection, so nothing is lost.
+
+Pinned by `PaneChangeReplayTest` (L2, `youtube-pane-straggler-after-home.jsonl`), which has two
+counterfactuals. The first is the same stream with `contentChangeTypes` zeroed (exactly what the old
+classifier saw), which must still start the phantom sitting and LAUNCH. The second is the reversed
+order, which is harmless under both rules. The class tests check that every pane event in every
+committed capture is `NotForeground` and that every other event classifies exactly as before.
+
+## What a "sitting" is, and what it is not
+
+`domain/sitting/SittingTracker` owns one question: *is the user still in a sitting with app X?* A
+sitting ends for three reasons and no others.
+
+| Cause | Ends on | Passthrough grant | Interaction count / time baseline |
+|---|---|---|---|
+| `WENT_HOME` | the gesture itself, at once (when the rule that granted the pass has "keep the pass on short trips" on: the launcher in front for ≥ the return window when the user comes back, #110) | revoked | **untouched** — a trip home must not refill a time budget |
+| `SCREEN_OFF` | the screen having been off for ≥ the return window when the user comes back | revoked | reset on return |
+| `ANOTHER_APP_HELD_FOREGROUND` | that app holding the foreground for ≥ the return window | revoked | reset once `InteractionTracker.SESSION_EXPIRY_MS` also passes |
+
+**Two windows, not one.** The sitting's return window (`SittingTracker.PASSTHROUGH_RETURN_WINDOW_MS`,
+2 minutes) is deliberately NOT `InteractionTracker.SESSION_EXPIRY_MS` (5 minutes), though sharing one
+constant reads tidier and was the first thing tried. They answer different questions: the session
+expiry asks *"should the time budget refill?"*, where generous is safe because the failure mode is a
+user farming a fresh budget; the return window asks *"did the user leave?"* and governs permission to
+skip a delay, where generous is a bypass. At five minutes a four-minute excursion keeps the pass, and
+ping-ponging under the window keeps it alive indefinitely. Two minutes is long enough to browse a
+gallery, short enough that using another app costs a fresh delay.
+
+**Per-rule opt-in: a launcher window as an ABSENCE (issue [#110](https://github.com/astraedus/nudge/issues/110)).**
+On gesture navigation Recents and the quick-switch swipe live in the launcher package
+(`com.sec.android.app.launcher` on Samsung, Quickstep in `nexuslauncher` on Pixel), so "swipe to the
+previous app and straight back" crosses a launcher window both ways. Device-captured on a Galaxy S24
+Ultra (`samsung-gesture-switch-revokes-grant.jsonl`): the default rule revoked the grant at the first
+launcher window and Telegram re-blocked after two seconds away. The stream cannot tell that swipe
+from a deliberate Home press followed by a fresh open from the icon, and which of the two matters
+depends on the APP (a messenger you hop out of to grab a photo, versus a feed you meant to leave), so
+it is a per-rule choice, off by default: **Keep the pass on short trips** in the app's rule editor,
+offered only for the modes that grant a pass (Delay, Hold, Breathing; `BlockMode.usesDuration`).
+
+How it flows, and why it cannot leak: `BlockRule.keepPassOnShortTrips` (DB 12->13) is read off the
+rule that DECIDED the block, like `tabVanish`, and only the timed-mode branch of `BlockEngine` sets
+`BlockDecision.Block.keepPassOnShortTrips`. The service puts it on the overlay intent, and
+`BlockOverlayActivity`'s grant hands it to `PassthroughManager.grant`, which hands it to
+`SittingTracker.onGrantEarned`, where it becomes the SITTING's `homeIsAbsence`. With it on, a launcher
+window starts the away clock instead of ending the sitting (first evidence wins, exactly like a
+screen-off since #54), and the shared 2-minute return window decides on return: back in time keeps
+the pass, staying away past it ends the sitting as `WENT_HOME`. Every way a sitting ends or moves
+(`end`, `reset`, a sitting started by a window, a sitting renewed after too long away, a grant for
+another app) clears the flag, so a sitting that holds no such grant behaves exactly as before #110.
+No length picker: one window for every absence. Turning it on is a Strict Mode weakening
+(`RuleWeakening`); it travels in exports, and an older export imports it off.
+
+**A grant also records whether it was earned against the WHOLE app (spec 5.5).** A grant has a
+package, and optionally a website (`webDomain`) or an in-app feature (`featureKey`). Only an
+app-level completion (neither) is *whole*: `PassthroughManager.isGrantedWhole(pkg)` is true when
+the package is granted AND the sitting's grant was whole, and a website grant later in the same
+package keeps it whole (the user earned the browser first, then a site inside it). A website-only or
+feature-only grant is not whole; the axis ends with the grant (`clear`, any sitting end, a grant for
+another package). It matters for one case only: a browser a group rule covers as a whole app
+(`web-domain-blocking.md`, "Browsers in a group"). For such a browser the service's two grant
+checks, `grantLetsThrough` and `grantAliveFor`, both go through `passthroughEarned`, which asks
+`isGrantedWhole` instead of `shouldSkipForegroundEvaluation`, so a finished website delay cannot
+keep open a browser its group blocks. For every other package `passthroughEarned` is the plain
+`shouldSkipForegroundEvaluation`, unchanged. Pinned by `PassthroughWholeAxisTest` (L1) and
+`GroupBrowserWiringContractTest` (site 4).
+
+The same browsers route through `evaluateBrowser` on both browser paths of the dispatch: the window
+change (`evaluateForegroundPackage`) and the debounced content change (`handleWindowContentChanged`,
+skipped while `grantAliveFor` is true). `GroupBrowserCaptureReplayTest` replays
+`chrome-open-and-browse.jsonl` through the classifier and that routing.
+
+**`WENT_HOME` can arrive by two event types, and only one of them is a window change
+([#58](https://github.com/astraedus/nudge/issues/58)).** `EventClassifier.classify` still restricts
+`ForegroundSignal.Home` to `TYPE_WINDOW_STATE_CHANGED` — launcher widget churn behind a fullscreen
+app must never revoke a delay. But device QA on 2026-09-25 caught the launcher arriving on a real
+Home press with **only** a content change, and on those runs the sitting simply never ended. The
+issue-#7 promotion path (`classifyVerifiedContentChangeAsSwitch`) therefore now answers `Home` for a
+launcher package, on exactly the evidence it already demands of an app: the package must own the
+**real active window**. Widget churn cannot pass that, because the app owns it while it is in front.
+What is widened is only *how the launcher may be recognised*, never *what may end a sitting* — that
+list is still these three causes. Detail, the counterfactuals and why the launcher had to be asked
+about ahead of `SYSTEM_PACKAGES`: `foreground-detection.md`.
+
+**An unknown package is never evidence the user left.** That single sentence is the fix for #28. A
+photo picker, a share sheet, a permission dialog, a custom tab, a notification hop and an OEM volume
+panel are all ordinary app packages, and they are sub-flows of the sitting by construction: another
+app in front for a few seconds is not five minutes. Nothing has to recognise them, which is what
+makes this different in kind from the four fixes before it — each of those added a name to a list,
+and every one of those lists has since sprung.
+
+`SCREEN_OFF` is deliberate and load-bearing. The return window makes a brief excursion cheaper than
+it used to be; a locked phone (backlog F5: *complete Instagram's delay, lock, unlock hours later
+straight back into Instagram, no delay*) now costs a fresh delay where it used to cost nothing. Net,
+the model is stricter where it matters and looser only where it was wrong.
+
+**A screen-off is an ABSENCE, not a departure (issue #54).** `SCREEN_OFF` used to end the sitting the
+instant the broadcast arrived, with no return window at all, on the premise written into the receiver
+that raises it: *a screen-off is not a timer, it is an observation that the user stopped using the
+phone*. The user who asked for HOLD mode (#35) falsified that by email on 2026-09-24 — he was holding
+sixty seconds, getting in, and paying again a minute later while still in the app reading client
+chats. Android blanks the display on lack of **input**, not lack of attention, and the Pixel default
+is 30 seconds, so reading inside the blocked app timed the screen out and unlocking straight back
+into it read as a brand-new arrival.
+
+It was the one end cause with no grace, and it was the *inconsistent* one: this model already rules
+that another app holding the foreground for 110 seconds is not a departure (the whole of #28), and a
+screen that blanked for 40 seconds and came back to the SAME app is strictly less of a departure than
+that. So a screen-off now starts the away clock exactly as a foreign app window does, and the same
+`PASSTHROUGH_RETURN_WINDOW_MS` decides on the user's return. F5 is untouched, because *hours* is far
+past the window; what changed is only the case where nobody went anywhere. The bug predates HOLD by
+every release the sitting model has shipped — a DELAY always had it — and went unreported because
+paying a 15-second countdown again reads as annoying where paying 60 seconds of sustained attention
+again reads as broken.
+
+It is a clock **start** rather than an end for a second reason: there is no `ACTION_SCREEN_ON` in this
+model and none is needed. `awaySinceMs` is read on the next app window, and its clock
+(`SystemClock.elapsedRealtime()`) counts while the device sleeps, so the absence measures itself.
+Whichever absence starts the clock also owns it: the **first** evidence wins, both the timestamp and
+the reported cause, so a user who switches apps and then lets the screen time out left when they
+switched, and a phone that blanks every thirty seconds cannot extend one departure forever.
+
+**The counting side shares that verdict.** `BlockLaunchGuard.onDeparture("screen_off")` used to fire
+unconditionally from the screen-off receiver, on the same premise. Leaving it there would have split
+this app's definition of *the user left* in two — enforcement forgiving a display timeout while
+counting still charged for it — and the split is visible on a block the user has **not** completed:
+no grant protects them, so the overlay comes back either way, and #36's invariant (*no `wasBlocked`
+row without a genuine departure*) then failed on #54's own definition. The departure is now raised
+from `NudgeAccessibilityService.onSittingEnded`, gated on the sitting having ended with cause
+`SCREEN_OFF`, which is the moment the verdict exists. `WENT_HOME` and `ANOTHER_APP_HELD_FOREGROUND`
+deliberately do not route there: both arrive as ordinary `ForegroundSignal`s and
+`BlockLaunchGate.arrivalAfterSignal` already ends the arrival on them, on the very signal that feeds
+the sitting. Their windows also differ on purpose — the arrival ends the moment another app is in
+front while the sitting holds for two minutes, because *is this block worth a row* and *is the user
+still in this app* have different safe directions.
+
+**And the Following steer shares it too, one release later (issue [#56](https://github.com/astraedus/nudge/issues/56)).**
+The steer's once-per-arrival memory was cleared from `hideAllOverlays`, which the same screen-off
+receiver calls to tear down overlays — so the third consumer was still running the falsified
+premise, and a thirty-second display timeout on the Home feed re-steered a user who had deliberately
+switched back to it. It now resets from `onSittingEnded` on **every** end cause (a `resetHostAppActuation`
+call beside the departure report above), because all three causes are departures by this model's own
+definition and Home-then-return is the plainest "next visit" there is. Note the pattern: one premise,
+three consumers, three separate releases to finish removing it. When a definition here changes, the
+question to ask is *who else believes the old one* — `FollowingSteerVisitWiringContractTest` now pins
+the answer as a discovered set rather than a memory.
+
+**An absence is cancelled by PRESENCE, not only by a navigation (issue [#64](https://github.com/astraedus/nudge/issues/64)).**
+The away clock is evidence of absence, and until 1.18.2 the only evidence of PRESENCE the model would
+accept was another `AppWindow` — which means *a window transition happened*, not *the user is here*
+(`EventClassifier` returns `NotForeground` for everything that is not a window change). A user
+actively using their app without changing windows — scrolling a feed, reading, typing — therefore had
+no way to contradict an absence they were not having.
+
+So one ordinary sub-flow armed a **fuse with no expiry**. A Chrome Custom Tab opened from Reddit, an
+"open with" chooser from Files, a share sheet, a permission dialog: all of them start the clock by
+design, on the premise (#28's) that the RETURN cancels it. When the return did not arrive as a window
+event — #58 measured that exact delivery flakiness on the bench Pixel 3, same gesture, same build —
+the clock kept burning, and the user's next in-app navigation, minutes later, was read as a return
+from a two-minute absence. The grant went and the block came back while they sat exactly where they
+had been. Reported by the #35 / #54 user on 2026-09-25 in Reddit, Gemini and Files, paying a fresh
+sixty-second HOLD each time, screen never off.
+
+The app was also contradicting itself for the whole of that window: `InteractionCounter` was counting
+those same taps and scrolls as *what the user did inside app X* and feeding them to auto-kick. One
+question, two opposite answers — the same split #54 found between enforcement and counting.
+
+`SittingTracker.onInteraction` closes it, and routes through the **same** "the user came back" branch
+`onAppWindow` uses rather than getting a rule of its own:
+
+| The interaction is | and the away clock is | so |
+|---|---|---|
+| in the sitting's app | running, under the window | cancelled, the sitting survives — the reported bug |
+| in the sitting's app | running, past the window | the sitting ENDS exactly as a window event would end it — no bypass is opened |
+| in another app, or there is no sitting | anything | nothing at all |
+
+A stray event from a backgrounded app can therefore only ever revoke **sooner**, never grant. An
+interaction in a foreign app is deliberately inert: it is weaker evidence than a window about what is
+in FRONT (a question this model has never owned), and the failure direction here is always to miss a
+revoke rather than interrupt someone mid-use. A foreign app that really is in front says so with a
+window event.
+
+**What this does not close.** If the fuse is armed spuriously and the user then goes past the return
+window without touching the app at all, their next touch or navigation still ends the sitting. The
+complete fix is to verify the foreign app is *still* in front instead of inferring it from one event
+— `docs/BACKLOG.md` records the mechanism (`UsageEvents.Event.getTaskRootPackageName()`, API 29+,
+which tells a sub-flow from a real switch outright).
+
+What the sitting does **not** do: decide whether to block. A foreign app window is still evaluated
+immediately and blocked on its own merits — opening a blocked app from a picker blocks at once, not
+five minutes later. The sitting governs only whose *grant* is alive.
+
+`SYSTEM_PACKAGES` survives, narrowed to the one question it can honestly answer: *should this be
+evaluated, and should the awareness overlays hide?* It is no longer allowed anywhere near *did the
+user leave*. That grouped-constant trap has now sprung three times — on the passthrough grant, on the
+foreground-time clock, and here.
+
+## What the counter counts
+
+`domain/interaction/InteractionCounter` counts **item transitions**, not events.
+
+`TYPE_VIEW_SCROLLED` carries `fromIndex`, `toIndex`, `currentItemIndex`, `itemCount`, and on API 28+
+`scrollDeltaX/Y`. None of it was read. The old rule was one count per event past a 500ms debounce,
+plus — for any package outside `InAppDetector.SUPPORTED_PACKAGES` — one count per second of
+`TYPE_WINDOW_CONTENT_CHANGED` standing in for taps.
+
+Measured on a Pixel 3:
+
+- **One slow 2.5-second drag emits TEN scroll events** and moves the index once
+  (`aosp-list-slow-scroll.jsonl`). The old rule scores that 2-3, and more for a longer gesture. That
+  is the reported "scrolling slowly between two posts counts as 5-6".
+- **An untouched phone on the Instagram feed emits scroll events anyway**
+  (`instagram-idle-no-input.jsonl`), five in 75 seconds, indices never moving. The old rule ticked on
+  them, and fed auto-kick, so it could eject a user for doing nothing.
+- **Three gestures in a list emit twenty-one events** and move the index eight times
+  (`yt-list-scroll-3-gestures.jsonl`).
+
+The rules, in order:
+
+- an item transition is one interaction, **forward only** (scrolling back up consumes nothing, and a
+  "jump to top" must not count forty items), capped per event as a guard against an adapter reset;
+- accumulated vertical distance against a screen height is the fallback **only** where a source
+  reports no indices at all;
+- horizontal-only movement is never an item — that is a carousel or a tab strip;
+- a source's first event establishes its position and counts zero. Counting it is how opening a sheet
+  used to register as a tap;
+- **debounces remain as guards against duplicate delivery, never as the counting mechanism.** The
+  difference is the whole fix: a debounce is a rate limit, and rate was never a measurement of what
+  the user did.
+
+Clicks count everywhere now. The old code took them only from packages *outside* the supported set,
+so a tap in Instagram counted nothing while a re-render in Discord counted one.
+
+**A session counts one unit.** Reels watched and buttons tapped are different things, and adding
+them silently is how "opening the comments counted as a tap" returns under a new name — the overlay
+would read "7 reels" after five swipes and two taps, and auto-kick would fire two items early.
+`CountMode.ITEMS` wins: the first item promotes a tap-counting session and resets it, so one stray
+tap on entering an app cannot silence the reel counter for the whole sitting.
+
+### Multiple scroll sources
+
+A screen often has more than one scrollable thing. Instagram's feed screen has two in ONE window:
+`android:id/list` and `com.instagram.android:id/swipeable_tab_view_pager`. Only the PRIMARY source
+counts, where primary means *the source that has most recently been producing item transitions*, and
+a newcomer may take over only after the incumbent has been silent past `handoverMs`. A sheet opened
+over a live feed therefore counts nothing; a list the user genuinely moves to and stays in does take
+over, because at that point they really are consuming it.
+
+The source key is `(windowId, className, viewIdResourceName)`. The view id is needed because a sheet
+is commonly another `RecyclerView` in the same window as the feed, and without it the two share a key
+and their indices interleave into phantom counts.
+
+It costs a binder round trip and is resolved **once per scroll event**, in every build including
+release. It was briefly cached under a 500ms throttle keyed on `(windowId, className)` -- which is
+self-defeating, since those are precisely the two fields that are identical for a sheet and the feed
+it opened over, so the sheet was handed the feed's id and counted as the feed. A cache keyed on the
+ambiguity it is disambiguating cannot work. The cost is ~10 IPC/second while the user is actively
+scrolling and nothing at rest, which is cheaper than the bounded 800-node tree walks this service
+already performs on a 1-second debounce, and `AccessibilityEventTrace` logs a periodic `COST` line
+during a capture so the number can be checked rather than argued about. While tracing, the factory
+has already put the id on the record and the handler reuses it rather than paying twice.
+
+**Known limits, measured rather than assumed** (see `docs/BACKLOG.md` for the follow-ups):
+
+- YouTube's **Shorts** pager emits no `TYPE_VIEW_SCROLLED` at all — screenshot-verified, 66 events
+  from five real flicks, every one a content change. The counter sees nothing there. It saw nothing
+  before this change either; what is new is knowing why.
+- On YouTube the comments list and the home feed share the SAME `viewIdResourceName`
+  (`com.google.android.youtube:id/results`) and class, so there they cannot be told apart and the
+  counter simply counts whichever list is being scrolled. That is the honest answer for that app.
+- **Items are not gestures.** One swipe on a free-scrolling feed can pass two posts, and the counter
+  says two, because two is what was consumed. On a paged surface (reels, shorts) the two coincide.
+
+`InAppDetector.SUPPORTED_PACKAGES` no longer gates counting at all. It went back to meaning what its
+name says — the apps whose in-app FEATURES we can recognise — and that recognition now supplies the
+counter's LABEL and nothing else. Detection holding a veto over counting is exactly why
+`docs/BACKLOG.md`'s "counter doesn't increment on YouTube swipes under a whole-app rule" was possible.
+
+The content-change proxy is **removed, not tightened**. A package we cannot measure now reads zero,
+which is honest; the old number was fabricated and wore the word "taps".
+
+## Capturing a device session
+
+This is the part to reach for first on the next report, before reading any code.
+
+```bash
+# 1. Install a debug build (or enable debug logging: tap the version number in Settings 7 times).
+#    adb install -r DROPS the accessibility grant — re-enable it or you capture nothing:
+adb -s "$DEVICE" shell settings put secure enabled_accessibility_services \
+  dev.astraedus.nudge/com.astraedus.nudge.service.NudgeAccessibilityService
+adb -s "$DEVICE" shell settings put secure accessibility_enabled 1
+
+# 2. Record while reproducing:
+scripts/a11y-capture.sh instagram-comments-overcount 30
+
+# 3. It writes app/src/test/resources/a11y-captures/<name>.jsonl. FILL IN THE HEADER — the
+#    EXPECTED line is the test oracle, and a fixture with no oracle cannot fail.
+
+# 4. Add the failing assertion to A11yCaptureReplayTest, THEN fix.
+```
+
+`AccessibilityEventCodec` holds the encoder and the decoder in one object on purpose: they are the
+contract between the device and the test suite. If they drifted, every committed capture would replay
+as a different stream than the device produced, and the tests would stay green against the wrong
+data — the worst failure a fixture suite can have.
+
+The trace costs one boolean test per event in a release build with debug logging off. The single
+expensive field, `viewIdResourceName`, is a binder read with two callers on different budgets: the
+factory reads it into the RECORD only while tracing, but `InteractionHandler` reads it in every build
+including release, once per scroll event, because telling a sheet from the feed behind it is a
+production decision. The trace reports the measured cost periodically, so "can we afford this?" is
+answered with numbers rather than opinion.
+
+### Probes that need no gestures
+
+`tools/qa/subflow-passthrough-probe.sh` and `tools/qa/passive-observe.sh` reproduce issue #28 using
+only `am start`, `monkey -c LAUNCHER` and `cmd media_session` — no taps, no swipes, no keyevents.
+Two things make that possible: the DELAY overlay auto-completes on its own timer (`DelayContent`'s
+`LaunchedEffect`), so a passthrough can be EARNED with no input; and the excursions are real system
+intents, which is what the reported sub-flows actually are.
+
+That matters beyond convenience. **Automation must never drive Instagram or TikTok over adb** —
+account-ban risk to the device's real logins, a hard rule with no QA carve-out, recorded in
+`tools/qa/ig-walkthrough-capture.sh`. Launching them and watching is fine, and is how
+`instagram-idle-no-input.jsonl` was taken. Everything that needs a real gesture is captured on
+YouTube or a stock AOSP list instead, which is no loss: **the counter must decide from generic event
+fields, never from per-app knowledge**, so a stock `androidx` RecyclerView is the honest control.
+
+### Two traps that cost time in this repo already
+
+- **`mCurrentFocus` does not tell you which SCREEN you are on** inside a single-activity app. Three
+  YouTube captures were taken on a video player while every focus check said "YouTube". Screenshot
+  and look.
+- **Relaunching a backgrounded YouTube puts it in picture-in-picture** when the block overlay
+  backgrounds it, and #19's PiP gate then swallows its events, so the gestures land on the launcher
+  instead. `tools/qa/scroll-capture.sh` force-stops first for this reason; 5 of 8 launches landed
+  wrong without it.
+
+## What the tests pin
+
+| Test | Pins |
+|---|---|
+| `SittingTrackerTest` | every branch of the model; one test per reported sub-flow; that no non-app signal can end a sitting; that an interaction inside the app cancels an absence (#64) while one past the window still ends the sitting — with the counterfactual that the pre-fix path really did leave the clock burning |
+| `EventClassifierTest` | every `ForegroundSignal` is reachable; the PiP gate is ahead of everything; an empty launcher set classifies nothing as Home; an awareness overlay is not `OwnUi` and every OTHER window of ours still is |
+| `AwarenessOverlayContractTest` | the overlays are built only from views that carry the identity, and the identity is derived from a real class |
+| `OwnClassNamespaceContractTest` | the applicationId and the namespace are different strings, production derives the namespace, and comparing a class name against the applicationId (issue #33) still cannot match |
+| `BlockLaunchGuardReplayTest` | issue #41 replayed through the real classifier and guard — the tick after an awareness overlay still LAUNCHes, with the counterfactual that the pre-fix classification DROPs it |
+| `InteractionCounterTest` | every counting branch, the primary-source election, the mode rules |
+| `A11yCaptureReplayTest` | the real device streams, each against its own oracle — plus counterfactuals showing the OLD rule really does fail each capture, so a passing fixture cannot be passing by luck |
+| `AccessibilityEventCodecTest` | encoder/decoder round trip, escaping, forward compatibility |
+| `PaneChangeReplayTest` | an accessibility-pane `WINDOW_STATE_CHANGED` claims nothing: YouTube's pane torn down after Home no longer starts a sitting or launches a Delay over the launcher, with the zeroed-`contentChangeTypes` and reversed-order counterfactuals; every pane event in every capture is `NotForeground` and nothing else changed classification |
+| `EventDispatchOrderContractTest` | classify-once and sitting-once above every early return; no branch re-derives the classification; `evaluateForegroundPackage` never clears the passthrough again; a click or a scroll actually REACHES the sitting model (#64), under the synthetic-click guard and before the counter is told — a pure-model fix nobody calls is a silent no-op with a green suite |
+| `HomeScreenPassthroughContractTest` | the Home / system-surface distinction, the Strict Mode guard's position, the global toggle's position |
+| `PassthroughWholeAxisTest` | the whole-app axis of a grant: app completion is whole, website or feature alone is not, a website grant inside an earned browser stays whole, never inherited from another package, ends with the sitting, whole always implies granted |
+| `GroupBrowserCaptureReplayTest` | `chrome-open-and-browse.jsonl` with a group Hard block covering Chrome: every Chrome evaluation blocks as an app and none reaches the website path, with the counterfactual that the pre-5.5 routing never blocks |
+| `GroupBrowserWiringContractTest` | the four service sites of spec 5.5 (foreground, content change, feature detection, both grant checks) and that `evaluateBrowser` is the only way to the website path |
+
+The counterfactual tests are worth the extra lines. `the old event-rate rule really would have
+over-counted this capture` and `the old rule really would have revoked the grant on this capture`
+assert that each fixture still CONTAINS the defect it was captured for. Without them, a fixture that
+quietly stopped reproducing would leave a green test asserting nothing.
+
+One gap, recorded honestly: the node-tree label path (`resolveLabelIfUnknown` -> `detectFeature`) is
+not JVM-reachable without a real `AccessibilityNodeInfo`, and there is no Robolectric in this module.
+It affects the counter's LABEL only, never its number.

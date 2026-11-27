@@ -1,0 +1,466 @@
+package com.astraedus.nudge.domain
+
+/**
+ * Pure Kotlin matcher for the generic content filter. No Android dependencies,
+ * fully unit-testable on the JVM.
+ *
+ * Two independent signals:
+ *  - [matchesDomain]: the URL's base domain (and any parent domains) is present
+ *    in the bundled blocklist set.
+ *  - [matchesKeyword]: a high-signal keyword appears in the raw URL text, as a
+ *    substring or (for the short [BOUNDARY_KEYWORDS]) at a word boundary (catches
+ *    search queries and unknown domains where the term is in the path/host/query).
+ *
+ * Both skip browser-internal schemes (chrome://, about://, etc.) via
+ * [WebDomainMatcher.extractDomain] / explicit scheme handling.
+ */
+object ContentFilterMatcher {
+
+    private val INTERNAL_SCHEME_PREFIXES = listOf(
+        "chrome://", "about:", "file://", "data:", "javascript:",
+        "chrome-native://", "content://"
+    )
+
+    /**
+     * Mainstream mixed-content platforms that must NEVER be domain-blocked, even if a regenerated
+     * blocklist re-introduces them. This is a regression guard: the upstream blocklist wrongly
+     * included reddit.com (a mainstream platform), which surfaced as plain Reddit browsing being
+     * blocked. Checked in [matchesDomain] BEFORE the blocklist, over the parent-strip walk so
+     * subdomains (i.redd.it, i.imgur.com, en.wikipedia.org) are covered too.
+     *
+     * Scope: this exempts the DOMAIN match ONLY. Keyword matching on the raw URL is deliberately NOT
+     * exempted — a URL like reddit.com/r/porn still blocks via [matchesKeyword], which is correct.
+     */
+    val ALLOWLIST: Set<String> = setOf(
+        "reddit.com",
+        "redd.it",
+        "redditmedia.com",
+        "redditstatic.com",
+        "twitter.com",
+        "x.com",
+        "imgur.com",
+        "discord.com",
+        "discordapp.com",
+        "tumblr.com",
+        "wikipedia.org"
+    )
+
+    /**
+     * High-signal explicit tokens used for keyword matching against the raw URL.
+     *
+     * False-positive reasoning:
+     *  - We deliberately AVOID short ambiguous tokens. The classic trap is bare
+     *    "sex" (matches "sussex", "essex", "middlesex", "sextant") and "anal"
+     *    (matches "analysis", "analog", "canal"). Neither is in this list.
+     *  - Every token here is either a coined/brand term (xvideos, xhamster,
+     *    redtube, brazzers, pornhub) that has no mainstream-word collision, or a
+     *    long compound unlikely to appear inside a benign domain/path
+     *    ("camgirl", "gangbang"). "hentai" / "nsfw" / "porn" are strong and
+     *    effectively never substrings of legitimate site URLs people browse.
+     *  - The short tokens that ARE the start of real words ("milf" in milford,
+     *    "xxx" in xxxl) are not in this substring set: see [BOUNDARY_KEYWORDS].
+     *  - The tokens below are SUBSTRING matches on the full URL (host + path + query), so a
+     *    search like "google.com/search?q=porn" or an unknown domain
+     *    "freepornsite.tld" is caught even when the domain isn't in the list.
+     *
+     * The bar for membership is: **would this token plausibly appear in a benign URL,
+     * or in a search a normal person makes?** If yes, it does not belong here. Four
+     * tokens were removed for failing that test — they are ordinary English words that
+     * happen to also be adult jargon:
+     *  - "escort"   — ford escort, police escort, escort carrier, Escort radar detectors.
+     *  - "hardcore" — hardcore punk, Hardcore History, hardcore difficulty modes.
+     *  - "creampie" — recipe slugs (`/recipes/coconut-creampie`).
+     *  - "fetish"   — `wikipedia.org/wiki/Commodity_fetishism`, psychology writing.
+     * The first three are gone entirely rather than demoted to
+     * [AMBIGUOUS_QUERY_KEYWORDS], because a whole-word query match would still fire on
+     * exactly the benign searches we are protecting ("ford escort review", "hardcore
+     * punk bands", "creampie recipe") — demotion would buy nothing. "fetish" IS demoted:
+     * as a whole word in a search query it is a strong signal, and it does not collide
+     * with "fetishism"/"fetishist" under whole-word matching.
+     */
+    private val SUBSTRING_KEYWORDS: List<String> = listOf(
+        "porn",
+        "nsfw",
+        "xvideos",
+        "xhamster",
+        "redtube",
+        "youporn",
+        "pornhub",
+        "brazzers",
+        "onlyfans",
+        "hentai",
+        "rule34",
+        "camgirl",
+        "camsoda",
+        "chaturbate",
+        "bukkake",
+        "bdsm",
+        "deepthroat",
+        "cumshot",
+        "blowjob",
+        "handjob",
+        "fapello",
+        "spankbang",
+        "nudez",
+        // Additional coined/compound low-collision tokens. Each is a brand name or
+        // compound that is effectively never a substring of a benign site URL, so
+        // they are safe as raw substring matches (same false-positive rationale as
+        // above: no short mainstream-colliding token — deliberately NOT bare "gif").
+        "redgifs",
+        "xnxx",
+        "eporner",
+        "tnaflix",
+        "youjizz",
+        "spankwire",
+        "keezmovies",
+        "porntrex",
+        "hqporner",
+        "faphouse",
+        "stripchat",
+        "bongacams",
+        "livejasmin",
+        "myfreecams",
+        "gangbang",
+        "gloryhole",
+        "porngif",
+        "gifporn",
+        "sexgif",
+        "nsfwgif",
+        "sextube",
+        "camwhore",
+        "pornstar"
+    )
+
+    /**
+     * Short tokens that are also the start of an innocent longer word, so they only count at a
+     * word boundary (issue #117). A raw substring match blocked `milford` (Milford, CT; Milford
+     * Sound, NZ), `milfoil` and `xxxl` (sizing) / `xxxtentacion`.
+     *
+     * A hit is real when the character on each side is not a letter: digits and separators
+     * (`. - _ / + ? = & #`), the start or end of the text, and a URL-encoded byte (`%20`, `%2F`)
+     * all count as boundaries, so `/milf/`, `milf-videos` and `?q=milf+x` still block. A single
+     * trailing "s" is tolerated (`milfs`).
+     *
+     * Accepted cost: a domain written as one run (`freemilfvideos.com`, `xxxvideos.com`) no longer
+     * matches here. The curated domain list is the place for those, per the curation policy in
+     * docs/architecture/content-filter.md.
+     *
+     * Membership: a token joins this set when it is short (<= 4 letters) AND a real word, name or
+     * place contains it. Coined tokens with no such collision stay in [SUBSTRING_KEYWORDS] so
+     * one-run domains keep blocking. Known collision left as a raw substring on purpose: "porn"
+     * (Pornichet, a French town) is the highest-signal token and most unknown adult domains are
+     * one-run `<word>porn<word>` names, so a boundary rule would gut the keyword layer.
+     */
+    val BOUNDARY_KEYWORDS: List<String> = listOf(
+        "milf",
+        "xxx"
+    )
+
+    /** Every built-in keyword: [SUBSTRING_KEYWORDS] match anywhere, [BOUNDARY_KEYWORDS] at a word boundary. */
+    val DEFAULT_KEYWORDS: List<String> = SUBSTRING_KEYWORDS + BOUNDARY_KEYWORDS
+
+    /**
+     * The boundary rule for one keyword. The lookbehind also accepts a preceding `%XX` escape,
+     * because the hex digit of `%2Dmilf` would otherwise read as a letter.
+     */
+    private val BOUNDARY_PATTERNS: Map<String, Regex> = BOUNDARY_KEYWORDS.associateWith {
+        Regex("""(?:(?<!\p{L})|(?<=%[0-9a-f]{2}))${Regex.escape(it)}s?(?!\p{L})""")
+    }
+
+    /**
+     * Ambiguous slang tokens that are dangerous as raw substring matches (e.g. "fetish"
+     * would block wikipedia.org/wiki/Commodity_fetishism) but genuinely wanted. These are
+     * matched ONLY as WHOLE WORDS inside a URL's SEARCH QUERY (never the host), via
+     * [matchesQueryKeyword], and the whole feature is gated behind an opt-in pref so the
+     * general userbase is unaffected.
+     *
+     * Curation: only genuinely-wanted-but-ambiguous tokens whose whole-word match in a
+     * search query is a strong signal. We deliberately skip tokens too collision-prone
+     * even as a whole word (e.g. bare "dp", which appears innocently in countless queries,
+     * and "escort"/"hardcore"/"creampie", whose benign whole-word searches — "ford escort
+     * review", "hardcore punk bands", "creampie recipe" — are exactly what we protect).
+     *
+     * The same membership test applies here as to [DEFAULT_KEYWORDS]. Three tokens were
+     * removed (issue #78) because their dominant everyday meaning is innocent, so a normal
+     * search blocked under strict mode:
+     *  - "bbc" is the broadcaster ("bbc news", "bbc iplayer").
+     *  - "cnc" is computer numerical control ("cnc machine", "cnc router").
+     *  - "sph" is school of public health, the sphere column of a lens prescription, or
+     *    smoothed-particle hydrodynamics.
+     * Kept despite a real innocent use, because the adult sense is still the dominant
+     * single-word search: "bbw" (Bath & Body Works shorthand), "bwc" (body-worn camera),
+     * "jav" (javelin shorthand).
+     */
+    val AMBIGUOUS_QUERY_KEYWORDS: List<String> = listOf(
+        "fetish",
+        "bwc",
+        "bbw",
+        "pawg",
+        "gilf",
+        "dilf",
+        "jav",
+        "femdom",
+        "cuckold",
+        "hotwife"
+    )
+
+    /**
+     * True if the URL's base domain (or any of its parent domains) is in the
+     * blocklist set. The blocklist contains lowercased base domains.
+     *
+     * Example: blocklist has "example.com"; "m.cdn.example.com" extracts to
+     * a host whose parent-strip reaches "example.com" -> match.
+     *
+     * Returns false for internal schemes / blank / unparseable input.
+     */
+    fun matchesDomain(urlBarText: String, blocklist: Set<String>): Boolean {
+        if (blocklist.isEmpty()) return false
+        val base = WebDomainMatcher.extractDomain(urlBarText) ?: return false
+        // Regression guard: mainstream mixed-content platforms are never domain-blocked, even if a
+        // regenerated blocklist re-introduces them. Wins over the blocklist unconditionally.
+        if (isAllowlisted(base)) return false
+        // Check the extracted base domain, then progressively strip the leftmost
+        // label so subdomains of a blocked base also match.
+        var candidate = base
+        while (candidate.contains('.')) {
+            if (candidate in blocklist) return true
+            val dot = candidate.indexOf('.')
+            candidate = candidate.substring(dot + 1)
+        }
+        return false
+    }
+
+    /**
+     * True if [host] (or any of its parent domains) is a mainstream mixed-content platform in
+     * [ALLOWLIST]. Takes an already-extracted host, so "i.redd.it" → parent "redd.it" matches, while
+     * a lookalike like "redditorporn.com" does not (it is a distinct base domain).
+     */
+    fun isAllowlisted(host: String): Boolean {
+        var candidate = host
+        while (candidate.contains('.')) {
+            if (candidate in ALLOWLIST) return true
+            val dot = candidate.indexOf('.')
+            candidate = candidate.substring(dot + 1)
+        }
+        return false
+    }
+
+    /**
+     * True if any keyword appears (case-insensitive) in the raw URL text: as a substring, except
+     * the [BOUNDARY_KEYWORDS], which must sit at a word boundary. Skips browser-internal schemes
+     * and blank input.
+     */
+    fun matchesKeyword(urlBarText: String, keywords: List<String>): Boolean {
+        val trimmed = urlBarText.trim()
+        if (trimmed.isBlank()) return false
+        val lower = trimmed.lowercase()
+        if (INTERNAL_SCHEME_PREFIXES.any { lower.startsWith(it) }) return false
+        return keywords.any { kw ->
+            val k = kw.lowercase()
+            k.isNotBlank() && (BOUNDARY_PATTERNS[k]?.containsMatchIn(lower) ?: lower.contains(k))
+        }
+    }
+
+    /**
+     * Case-insensitive names of query parameters that commonly carry the user's search
+     * terms across mainstream engines (Google/DDG/Bing `q`, YouTube/generic `query`,
+     * YouTube `search_query`, Yahoo `p`, Yandex `text`, Baidu `wd`, Amazon `k`, and
+     * a couple of other common ones).
+     */
+    private val SEARCH_QUERY_PARAMS = setOf(
+        "q", "query", "search_query", "p", "text", "wd", "k", "kw", "kp"
+    )
+
+    /** Path prefixes that carry the search terms directly in the path, e.g. `/search/<terms>`. */
+    private val SEARCH_PATH_PREFIXES = listOf("/search/", "/s/")
+
+    /**
+     * Extract the decoded, lowercased search terms from a URL bar string, or null if the
+     * input does not look like a search URL (or is an internal scheme / blank).
+     *
+     * A tiny hand-rolled parser — intentionally NOT android.net.Uri — so it stays pure
+     * JVM-testable. Handles:
+     *  - query params [SEARCH_QUERY_PARAMS] (param names compared case-insensitively);
+     *  - path-style search: [SEARCH_PATH_PREFIXES] (`/search/<terms>`, `/s/<terms>`).
+     *
+     * Decoding is best-effort: `+` and `%20` become spaces and other `%XX` escapes are
+     * percent-decoded (a malformed escape is left as-is rather than throwing).
+     */
+    fun extractSearchQuery(urlBarText: String): String? {
+        val trimmed = urlBarText.trim()
+        if (trimmed.isBlank()) return null
+        val lower = trimmed.lowercase()
+        if (INTERNAL_SCHEME_PREFIXES.any { lower.startsWith(it) }) return null
+
+        // Strip scheme so path/query parsing is uniform (reuse the internal-scheme list
+        // plus the common web schemes).
+        val schemeless = stripScheme(trimmed)
+
+        // 1) Query-string params: everything after the first '?'.
+        val qIndex = schemeless.indexOf('?')
+        if (qIndex >= 0) {
+            val queryString = schemeless.substring(qIndex + 1).substringBefore('#')
+            for (pair in queryString.split('&')) {
+                val eq = pair.indexOf('=')
+                if (eq <= 0) continue
+                val name = pair.substring(0, eq)
+                if (name.lowercase() in SEARCH_QUERY_PARAMS) {
+                    val raw = pair.substring(eq + 1)
+                    val decoded = decode(raw)
+                    if (decoded.isNotBlank()) return decoded.lowercase()
+                }
+            }
+        }
+
+        // 2) Path-style search: /search/<terms> or /s/<terms>. Compare on the path only
+        //    (strip host by finding the first '/', and drop any query/fragment).
+        val pathStart = schemeless.indexOf('/')
+        if (pathStart >= 0) {
+            val path = schemeless.substring(pathStart).substringBefore('?').substringBefore('#')
+            val lowerPath = path.lowercase()
+            for (prefix in SEARCH_PATH_PREFIXES) {
+                if (lowerPath.startsWith(prefix)) {
+                    val terms = path.substring(prefix.length).trimEnd('/')
+                    val decoded = decode(terms)
+                    if (decoded.isNotBlank()) return decoded.lowercase()
+                }
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * True if any keyword appears as a WHOLE WORD inside the URL's search query (extracted
+     * via [extractSearchQuery]). Returns false when the URL is not a search URL — the host
+     * is NEVER inspected, so "https://example.com/news" does not match. Whole-word matching means
+     * "fetish" matches the query "fetish" / "fetish gear" but NOT "fetishism" / "afetish".
+     *
+     * Aggressive-opt-in tradeoff: because this matches whole words in the raw query, a legit
+     * multi-word query that happens to contain the word (e.g. "bbw candle sale") WILL match.
+     * That is the intended cost of the opt-in strict-keyword mode — see the pref gate.
+     *
+     * [allowlist] is the user's way out of that cost (issue #78): a search on an allowed site, or a
+     * keyword hit lying entirely inside an allowed word or phrase, does not match. The default is
+     * [ContentFilterAllowlist.EMPTY], i.e. no exceptions, which is the fail-closed direction.
+     */
+    fun matchesQueryKeyword(
+        urlBarText: String,
+        keywords: List<String>,
+        allowlist: ContentFilterAllowlist = ContentFilterAllowlist.EMPTY
+    ): Boolean {
+        if (allowlist.coversHost(urlBarText)) return false
+        val query = extractSearchQuery(urlBarText) ?: return false
+        if (query.isBlank()) return false
+        return keywords.any { kw ->
+            kw.isNotBlank() &&
+                Regex("""\b${Regex.escape(kw.lowercase())}\b""").findAll(query)
+                    .any { hit -> !allowlist.excuses(query, hit.range) }
+        }
+    }
+
+    /**
+     * True if the user's own "Blocked words & sites" catches [urlBarText].
+     *
+     * A word or phrase is a case-insensitive raw substring of the whole URL bar text, the same rule
+     * [matchesKeyword] applies: a user word may be short or ambiguous ("sex", "crypto"), so a
+     * whole-word rule would miss the compound the user meant. A site entry covers its host and
+     * subdomains.
+     *
+     * [allowlist] is the correction path, and it is the ONE place that list reaches beyond strict
+     * keyword matching: a page on an allowed host skips this layer entirely (paths and searches
+     * included), and a blocked word whose every occurrence sits inside an allowed phrase is excused.
+     * Without that, a user word that is too broad would have no fix from inside the app — blocking
+     * `sex` and allowing `sussex.ac.uk` has to make that university usable, including its
+     * sex-education pages.
+     *
+     * That reach is bounded in two ways. It never touches the curated domain list or
+     * [DEFAULT_KEYWORDS], so the built-in protection still applies on an allowed host. And ADDING an
+     * allow entry is itself a weakening change, gated by Strict Mode
+     * ([com.astraedus.nudge.domain.lock.ContentFilterAllowlistWeakening]), so widening this layer is
+     * a deliberate, challenged act rather than a free one.
+     */
+    fun matchesUserBlocklist(
+        urlBarText: String,
+        blocklist: ContentFilterBlocklist,
+        allowlist: ContentFilterAllowlist = ContentFilterAllowlist.EMPTY
+    ): Boolean {
+        if (blocklist.isEmpty) return false
+        val trimmed = urlBarText.trim()
+        if (trimmed.isBlank()) return false
+        val lower = trimmed.lowercase()
+        if (INTERNAL_SCHEME_PREFIXES.any { lower.startsWith(it) }) return false
+        if (allowlist.coversHost(trimmed)) return false
+
+        val host = WebDomainMatcher.extractDomain(trimmed)
+        if (host != null && ContentFilterUserList.hostMatches(host, blocklist.domains)) return true
+
+        for (pattern in blocklist.wordPatterns) {
+            for (hit in pattern.findAll(lower)) {
+                if (!allowlist.excuses(lower, hit.range)) return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * The whole content-filter verdict for one URL-bar string: the curated domain list, OR a
+     * high-signal keyword substring, OR the user's own blocked words and sites, OR (only when
+     * [strictKeywords]) an ambiguous keyword as a whole word in the search query that [allowlist]
+     * does not excuse.
+     *
+     * The allowlist reaches the user block list (it is the user's own correction path) and the
+     * strict layer. It never reaches the curated domains or [DEFAULT_KEYWORDS]; see
+     * [ContentFilterAllowlist] for why.
+     */
+    fun isBlocked(
+        urlBarText: String,
+        blocklist: Set<String>,
+        strictKeywords: Boolean,
+        allowlist: ContentFilterAllowlist,
+        userBlocklist: ContentFilterBlocklist = ContentFilterBlocklist.EMPTY
+    ): Boolean =
+        matchesDomain(urlBarText, blocklist) ||
+            matchesKeyword(urlBarText, DEFAULT_KEYWORDS) ||
+            matchesUserBlocklist(urlBarText, userBlocklist, allowlist) ||
+            (strictKeywords && matchesQueryKeyword(urlBarText, AMBIGUOUS_QUERY_KEYWORDS, allowlist))
+
+    private val WEB_SCHEME_PREFIXES = listOf("http://", "https://")
+
+    /** Strip a leading scheme (web or internal) so host/path/query parsing is uniform. */
+    private fun stripScheme(text: String): String {
+        val lower = text.lowercase()
+        for (prefix in WEB_SCHEME_PREFIXES + INTERNAL_SCHEME_PREFIXES) {
+            if (lower.startsWith(prefix)) return text.substring(prefix.length)
+        }
+        return text
+    }
+
+    /**
+     * Best-effort URL-component decode: `+` -> space, `%20` -> space, other `%XX` ->
+     * their byte value. A malformed escape is left untouched rather than throwing.
+     */
+    private fun decode(raw: String): String {
+        if (raw.isEmpty()) return raw
+        val sb = StringBuilder(raw.length)
+        var i = 0
+        while (i < raw.length) {
+            val c = raw[i]
+            when {
+                c == '+' -> { sb.append(' '); i++ }
+                c == '%' && i + 2 < raw.length -> {
+                    val hex = raw.substring(i + 1, i + 3)
+                    val code = hex.toIntOrNull(16)
+                    if (code != null) {
+                        sb.append(code.toChar())
+                        i += 3
+                    } else {
+                        sb.append(c); i++
+                    }
+                }
+                else -> { sb.append(c); i++ }
+            }
+        }
+        return sb.toString()
+    }
+}

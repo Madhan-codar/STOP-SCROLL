@@ -1,0 +1,177 @@
+package com.astraedus.nudge.ui.overlay
+
+import android.content.Intent
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.DirectionsWalk
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import com.astraedus.nudge.domain.walk.Walk2UnlockState
+import com.astraedus.nudge.ui.walk.WalkUnlockActivity
+
+/** The rule name Walk2Unlock uses when creating its synthetic block decision. */
+private const val WALK2UNLOCK_RULE_NAME = "Walk2Unlock"
+
+@Composable
+fun HardBlockContent(
+    packageName: String,
+    onGoBack: () -> Unit,
+    ruleName: String? = null,
+    untilText: String? = null,
+    appLabel: String? = null,
+    dailyTimeRemainingMs: Long? = null,
+    dailyLimitMinutes: Int? = null,
+    messagePool: List<String> = NudgeMessages.hardBlockMessages,
+    canUseEmergencyPass: Boolean = false,
+    emergencyLocked: Boolean = false,
+    nextPassMs: Long = 0L,
+    onUseEmergencyPass: () -> Unit = {},
+    redirect: @Composable () -> Unit = {}
+) {
+    val message = remember { messagePool.random() }
+
+    // Centred while it fits, scrollable only when it does not: see overlayContentScroll.
+    val scroll = rememberScrollState()
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        // Clear only while CameraBackdrop draws the camera under it; the theme background otherwise.
+        color = overlaySurfaceColor()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                // targetSdk 36 enforces edge-to-edge with no opt-out, so the window now spans
+                // under the status and navigation bars. The Surface above stays full-bleed (the
+                // block must cover every pixel of the app behind it); only the CONTENT is inset.
+                .safeDrawingPadding()
+                .overlayContentScroll(scroll)
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Block,
+                contentDescription = "Blocked",
+                modifier = Modifier.size(80.dp),
+                tint = MaterialTheme.colorScheme.error
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Text(
+                text = appLabel ?: "App Blocked",
+                style = MaterialTheme.typography.headlineLarge,
+                color = MaterialTheme.colorScheme.onBackground
+            )
+
+            if (dailyTimeRemainingMs != null && dailyTimeRemainingMs <= 0L && dailyLimitMinutes != null) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Daily limit reached",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = packageName,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.outline,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            LeaveButton(text = "Go Back", onClick = onGoBack)
+
+            // Walk2Unlock: show "Walk to unlock" button when this block is from the Walk2Unlock gate.
+            if (ruleName == WALK2UNLOCK_RULE_NAME) {
+                val context = LocalContext.current
+                Spacer(Modifier.height(12.dp))
+                val (walk2Key, isPhase2) = remember(packageName) {
+                    val key = when (packageName) {
+                        Walk2UnlockState.KEY_INSTAGRAM      -> Walk2UnlockState.KEY_INSTAGRAM to false
+                        Walk2UnlockState.KEY_FACEBOOK       -> Walk2UnlockState.KEY_FACEBOOK to false
+                        // YouTube: Shorts key, Phase depends on daily usage — the enforcer decides,
+                        // but on the overlay we default to Phase 3 (extra) since we don't have
+                        // daily usage here. Walk2UnlockActivity handles both phases identically.
+                        else                                -> Walk2UnlockState.KEY_YOUTUBE_SHORTS to false
+                    }
+                    key
+                }
+                Button(
+                    onClick = {
+                        context.startActivity(
+                            Intent(context, WalkUnlockActivity::class.java).apply {
+                                putExtra(WalkUnlockActivity.EXTRA_PACKAGE_KEY, walk2Key)
+                                putExtra(WalkUnlockActivity.EXTRA_IS_PHASE2, isPhase2)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                        )
+                    },
+                    modifier = Modifier
+                        .widthIn(max = 320.dp)
+                        .fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.DirectionsWalk,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.widthIn(min = 8.dp))
+                    Text("Walk to unlock 🚶", style = MaterialTheme.typography.titleMedium)
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // The redirect app: one tap leaves for somewhere better, through the same walk-away.
+            redirect()
+
+            EmergencyPassAction(
+                canUse = canUseEmergencyPass,
+                locked = emergencyLocked,
+                nextPassMs = nextPassMs,
+                onUse = onUseEmergencyPass
+            )
+
+            RuleFooter(ruleName = ruleName, until = untilText)
+        }
+    }
+}

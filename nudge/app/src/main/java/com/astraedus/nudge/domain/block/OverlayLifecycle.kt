@@ -1,0 +1,496 @@
+package com.astraedus.nudge.domain.block
+
+/**
+ * Every lifecycle DECISION `BlockOverlayActivity` makes, as a pure state machine.
+ *
+ * ## Why this class exists
+ *
+ * Three of this repo's shipped bugs were Activity lifecycle ORDERING bugs, and all three were
+ * invisible to a suite of ~1550 green unit tests:
+ *
+ *  - [#8](https://github.com/astraedus/nudge/issues/8) the countdown kept running while the overlay
+ *    was stopped, hit zero invisibly and granted passthrough;
+ *  - [#15](https://github.com/astraedus/nudge/issues/15) a block re-delivered through `onNewIntent`
+ *    inherited the previous block's countdown state;
+ *  - [#26](https://github.com/astraedus/nudge/issues/26) the walk-away's `finish()` raced the
+ *    dispatched `GLOBAL_ACTION_HOME`, popped the blocked app back to the front, and the block
+ *    re-armed over an app the user had just declined. Three reporters saw it every time; the bench
+ *    Pixel 3 never reproduced it once.
+ *
+ * Plus the re-delivery and destroy-ordering mechanisms of
+ * [#36](https://github.com/astraedus/nudge/issues/36) (2500 interventions in one day).
+ *
+ * None of those live in a *value* any test could read while the decisions sat inside an Activity:
+ * an Activity is not JVM-constructible (Android lifecycle, Hilt field injection, Compose), so the
+ * repo's only tool was a source-level grep that pins a SPELLING. The decisions are ordinary state
+ * transitions, though — "is this delivery allowed to record a walk-away", "which pending overlay am
+ * I", "may this fail-safe still fire" — so they are extracted here, where a JVM test can drive the
+ * real sequence, against the real [BlockLaunchGuard][com.astraedus.nudge.service.BlockLaunchGuard],
+ * and assert what the user would see.
+ *
+ * ## Shape
+ *
+ * Each method takes the platform facts the Activity owns and cannot be asked for here
+ * (`isFinishing`, `isChangingConfigurations`, `isDestroyed`, whether the lifecycle is at least
+ * STARTED) and returns the ORDERED [Effect]s the Activity must perform. The order of the returned
+ * list is load-bearing and is asserted directly: [Effect.ArmWalkAwayWindow] before [Effect.GoHome]
+ * is issue #26's fix, and [Effect.ArmWalkAwayWindow] before [Effect.Finish] on the fail-safe is the
+ * same fix at the moment of the pop it deliberately causes.
+ *
+ * ## What this class deliberately does NOT know
+ *
+ * The blocked app's package, the block mode, the intent, the Compose tree. Those are the Activity's
+ * business; what is here is only the ordering and the per-delivery bookkeeping. And it cannot prove
+ * the Activity actually calls it — that half stays a source-level contract
+ * (`BlockOverlayLaunchContractTest`, `BlockOverlayWalkAwayContractTest`).
+ */
+class OverlayLifecycle {
+
+    /** Something the Activity must do. Ordered; see the class doc. */
+    sealed interface Effect {
+
+        /** Tell the service no block overlay is covering an app any more. */
+        data object MarkOverlayInactive : Effect
+
+        /** `finish()`. */
+        data object Finish : Effect
+
+        /** `BlockLaunchGuard.onOverlayShown()` — the overlay is genuinely on screen. */
+        data object ReportOverlayShown : Effect
+
+        /**
+         * `BlockLaunchGuard.onOverlayDismissed(overlayId)`, carrying the id of the delivery THIS
+         * instance adopted, never "whatever is pending now". See [onDelivered].
+         */
+        data class ReportOverlayDismissed(val overlayId: Long) : Effect
+
+        /** `BlockLaunchGuard.onWalkAwayStarted(packageName)` — a departure is in flight. */
+        data class ArmWalkAwayWindow(val packageName: String) : Effect
+
+        /** `RecordWalkAwayUseCase.record(...)` — the one writer of `userChangedMind = true`. */
+        data class RecordWalkAway(val packageName: String, val blockMode: String) : Effect
+
+        /** Dispatch `GLOBAL_ACTION_HOME`, with the HOME intent as the fallback. */
+        data object GoHome : Effect
+
+        /**
+         * Leave for the user's redirect app instead of the launcher: start [packageName]'s launch
+         * intent in its own task. The walk-away's destination, nothing else — the activity falls
+         * back to [GoHome] if the launch fails, because failing to leave would trap the user in the
+         * app they just turned down.
+         */
+        data class LaunchRedirectApp(val packageName: String) : Effect
+
+        /**
+         * A WEBSITE block's walk-away: navigate [browserPackage] off the blocked page, landing the
+         * user in that browser on a neutral page (issue #78; see [WebBlockEscape] for the how and
+         * the why). In the slot [GoHome] takes for an app block.
+         *
+         * [fallback] is what to do instead when the escape cannot be performed: no activity takes
+         * the intent, the start is refused, or [WebBlockEscape] says this browser's last escape did
+         * not take. It is the ordinary walk-away tail, decided here rather than improvised by the
+         * activity, so the order the #26 fix depends on (the window armed BEFORE the go-home) is
+         * asserted on the fallback too.
+         */
+        data class LeaveBlockedPage(
+            val browserPackage: String,
+            val fallback: List<Effect>
+        ) : Effect
+
+        /**
+         * The user waited the timer out, so the app may be opened: `PassthroughManager.grant(...)`.
+         * Emitted ONLY when the overlay is at least STARTED — a countdown that somehow completed
+         * while backgrounded must never open the app (issue #8).
+         */
+        data object GrantPassthrough : Effect
+
+        /** Post [token]'s fail-safe finish [delayMs] from now. */
+        data class ScheduleFailSafeFinish(val token: Int, val delayMs: Long) : Effect
+
+        /** Drop any fail-safe left over from a previous delivery. */
+        data object CancelPendingFailSafe : Effect
+
+        /** One `w` line: the dispatched go-home never stopped us. */
+        data object LogFailSafeFired : Effect
+
+        /**
+         * Spend today's daily 2-minute pass on the blocked app: `EmergencyPassManager.usePass(...)`.
+         * Emitted only while the block is still in force ([onEmergencyPassTapped], #170).
+         */
+        data object UseEmergencyPass : Effect
+
+        /**
+         * The block screen is in a split-screen half, a floating window or PiP (issue #71): remove
+         * this task and start the same block in a fresh, fullscreen one. See [OverlayWindowMode].
+         */
+        data object RelaunchFullscreen : Effect
+    }
+
+    /**
+     * Which pending overlay in `BlockLaunchGuard` this ACTIVITY INSTANCE is, adopted once per
+     * delivery.
+     *
+     * The dying instance must not clear the live one's state. An overlay that finishes itself from
+     * `onStop` while the service launches a replacement has its `onDestroy` run AFTER the
+     * replacement's `onResume`, so an unconditional clear wiped the live overlay's pending state and
+     * handed the newly blocked app's own start-up window events straight back to the bypass rule —
+     * a second overlay and a second `wasBlocked` row for one entry. Part of issue #36.
+     */
+    var overlayId: Long = BlockLaunchGate.NO_OVERLAY_ID
+        private set
+
+    /**
+     * Incremented on every delivery, so each delivered block composes under a fresh Compose `key`
+     * and discards the previous block's remembered countdown state (issue #15: the overlay showed
+     * the NEW app's name over the PREVIOUS app's remaining seconds, and the progress ring froze
+     * because 30 remaining over a 15s delay is 2.0).
+     *
+     * A COUNTER rather than the block's contents: two different apps can legitimately share a
+     * package/mode/delay triple, and re-delivering the *same* block is still a new attempt that must
+     * start from full. It doubles as the fail-safe's identity — see [onFailSafeFired].
+     */
+    var renderToken: Int = 0
+        private set
+
+    /**
+     * Set when THIS DELIVERY has terminated as a walk-away, so the path runs exactly once no matter
+     * how many times it is reached (the button, the back gesture, or a double tap).
+     *
+     * Per delivery, not per activity. It used to be latched for the life of the activity, which was
+     * correct only while `navigateHome` finished immediately: a re-delivered block always arrived on
+     * a fresh instance. Deferring that finish (see [WALK_AWAY_FINISH_FAILSAFE_MS]) made it false —
+     * the activity now stays RESUMED for up to 1200ms after a walk-away, and a block for a DIFFERENT
+     * package delivered inside that window renders on this same instance. Against a latched flag its
+     * "I changed my mind" and its back gesture would both be dead, and on a `HARD_BLOCK`, which has
+     * no completion path, that is a user with no way off the screen.
+     */
+    private var walkedAway = false
+
+    /**
+     * Set when THIS DELIVERY's walk-away left through [Effect.LeaveBlockedPage]. The fail-safe then
+     * means the browser never came forward, so it falls back to going home once instead of
+     * finishing onto the blocked page. Per delivery, like [walkedAway].
+     */
+    private var leavingPage = false
+
+    /**
+     * Set once this instance has handed its block to a fullscreen replacement ([onRelaunchingFullscreen]).
+     *
+     * The replacement adopts the SAME pending overlay (nothing new was launched through the
+     * service), so this instance's stop and destroy must not report it dismissed or mark the overlay
+     * inactive: that would strip the live, fullscreen replacement of its protection, the #36 shape.
+     * Per instance, not per delivery: once handed off, nothing this instance does is the block any more.
+     */
+    var handedOff = false
+        private set
+
+    companion object {
+        /**
+         * How long the walk-away path waits for the dispatched go-home to stop us, before finishing
+         * anyway.
+         *
+         * The normal path is not this timer: `GLOBAL_ACTION_HOME` brings the launcher forward, the
+         * activity is stopped, and `onStop` finishes it — from the BACKGROUND, where finishing pops
+         * nothing forward. This exists only so a go-home the platform accepted and never honoured
+         * cannot strand the user on an overlay whose buttons are already spent.
+         *
+         * Deliberately SHORTER than [BlockLaunchGate.WALK_AWAY_TRANSITION_MS] (1500ms). The two
+         * numbers are one mechanism: if this fail-safe fires, its finish pops back to the blocked
+         * app's task — exactly the resurfacing issue #26 is about — and it must land while the
+         * service's walk-away window is still open to suppress the block it would otherwise re-arm.
+         * Both are now plain constants, so `BlockOverlayLaunchContractTest` compares the VALUES
+         * instead of regexing one of them out of a source file.
+         */
+        const val WALK_AWAY_FINISH_FAILSAFE_MS = 1_200L
+    }
+
+    /**
+     * A block has been delivered to this instance — through `onCreate` for the first one, through
+     * `onNewIntent` for every later one, since the activity is `singleInstance` and `onCreate` never
+     * runs a second time.
+     *
+     * A NEW delivery is a NEW attempt: it gets its own walk-away budget, its own timers, and its own
+     * Compose key. [pendingOverlayId] is read from the guard by the caller at this exact moment
+     * because a delivery runs synchronously from `onCreate`/`onNewIntent`, i.e. immediately after
+     * the service's `startActivity`, so the guard's current pending overlay IS this delivery's.
+     *
+     * The fail-safe is dropped here as well as guarded by [renderToken]; cancelling means nobody has
+     * to know about the token guard to reason about a re-delivery.
+     */
+    fun onDelivered(pendingOverlayId: Long): List<Effect> {
+        walkedAway = false
+        leavingPage = false
+        overlayId = pendingOverlayId
+        renderToken++
+        return listOf(Effect.CancelPendingFailSafe)
+    }
+
+    /**
+     * The delivered block cannot be rendered (`BlockMode.NONE` blocks nothing, so `BlockEngine`
+     * never produces one and this activity should never be launched for it). Dismiss rather than
+     * render: there is no "no-op overlay", and showing any of the three would gate an app the user
+     * explicitly chose not to gate.
+     */
+    fun onUnrenderableBlock(): List<Effect> = listOf(Effect.MarkOverlayInactive, Effect.Finish)
+
+    /**
+     * The overlay is genuinely ON SCREEN, which is a different fact from "we started it".
+     *
+     * The service sets `isOverlayActive` at `startActivity`, hundreds of milliseconds before this,
+     * and in that gap the blocked app is still starting up and still firing window events of its
+     * own. Reporting from here is the only reliable evidence of when the gap closes: the
+     * accessibility stream cannot supply it, because the overlay TASK's first window arrives ~600ms
+     * early carrying a framework class name. See [BlockLaunchGate.isGenuineBypass].
+     */
+    fun onResumed(): List<Effect> = listOf(Effect.ReportOverlayShown)
+
+    /**
+     * Leaving the overlay ABANDONS the block attempt (issue #8).
+     *
+     * This activity is `singleInstance` in its own task with an empty `taskAffinity`, so tabbing out
+     * (Home, a recents switch, screen off) only STOPPED it — it stayed alive in the background with
+     * its countdown still running, hit zero invisibly, granted passthrough, and the blocked app then
+     * opened with no delay at all.
+     *
+     * @param isFinishing a completion path (timer, walk-away, emergency pass) already finished us,
+     *   so finishing again would be a second mark-inactive for one dismissal.
+     * @param isChangingConfigurations a ROTATION must not dismiss a live block.
+     */
+    fun onStopped(isFinishing: Boolean, isChangingConfigurations: Boolean): List<Effect> =
+        if (isFinishing || isChangingConfigurations || handedOff) {
+            emptyList()
+        } else {
+            listOf(Effect.MarkOverlayInactive, Effect.Finish)
+        }
+
+    /**
+     * The user waited the timer out.
+     *
+     * @param hasPassthroughTarget false when the delivery carried no package to grant to.
+     * @param atLeastStarted whether the overlay is at least STARTED. A countdown that somehow
+     *   reached zero while backgrounded must never open the app — that silent grant WAS issue #8's
+     *   bypass, and this is the belt-and-braces layer behind the lifecycle-gated ticker and
+     *   [onStopped].
+     */
+    fun onTimerCompleted(hasPassthroughTarget: Boolean, atLeastStarted: Boolean): List<Effect> =
+        buildList {
+            if (hasPassthroughTarget && atLeastStarted) add(Effect.GrantPassthrough)
+            add(Effect.MarkOverlayInactive)
+            add(Effect.Finish)
+        }
+
+    /**
+     * The block this screen shows has ENDED by the clock: its rule's window closed, or a spent daily
+     * limit reset at midnight ([BlockInForce], #170). Close the screen and land the user back in
+     * the app.
+     *
+     * The close is a plain finish WHILE RESUMED, and that pop is wanted here. It is the very
+     * mechanism the walk-away avoids (#26): the app underneath comes forward and fires a real window
+     * event, and the service evaluates that arrival afresh. If another rule covers the app, that
+     * block is launched; if nothing does, the user is simply back in their app. No pass is granted,
+     * so a rule still in force cannot be skipped through this path.
+     *
+     * Refused (an empty list) when it would not be THIS screen closing on THIS block:
+     *  - [token] is not the current [renderToken]: a newer block was delivered, and its own end is
+     *    its own;
+     *  - this delivery already walked away, or the block was handed to a fullscreen replacement;
+     *  - the activity is finishing or destroyed;
+     *  - it is not at least STARTED. Invariant #8 already finishes a stopped overlay from
+     *    [onStopped]; this keeps the end from being a second finish behind it.
+     */
+    fun onBlockEnded(
+        token: Int,
+        atLeastStarted: Boolean,
+        isFinishing: Boolean,
+        isDestroyed: Boolean
+    ): List<Effect> =
+        if (token != renderToken || walkedAway || handedOff || isFinishing || isDestroyed || !atLeastStarted) {
+            emptyList()
+        } else {
+            listOf(Effect.MarkOverlayInactive, Effect.Finish)
+        }
+
+    /**
+     * "Use for 2 minutes" was tapped.
+     *
+     * The pass is spent only while the block is still in force ([BlockInForce.isInForce], #170). A
+     * tap that lands after the block's end (the screen is a frame from closing itself) closes the
+     * screen exactly as the end would and keeps the day's one pass for a block that needs it.
+     */
+    fun onEmergencyPassTapped(inForce: Boolean): List<Effect> =
+        if (inForce) {
+            listOf(Effect.UseEmergencyPass, Effect.Finish)
+        } else {
+            listOf(Effect.MarkOverlayInactive, Effect.Finish)
+        }
+
+    /**
+     * The user walked away: "I changed my mind", or the back gesture.
+     *
+     * Returns an EMPTY list for a second call within the same delivery — the once-only gate. A
+     * double tap, or a tap racing the back button, cannot log two walk-aways for one attempt.
+     *
+     * The order is the fix for issue #26, and every step of it matters:
+     *
+     *  1. record the walk-away (through a process-lifetime use case, so the insert is not tied to an
+     *     activity that is destroyed microseconds later);
+     *  2. clear the overlay flag — the block is over the moment the user turns around;
+     *  3. **arm the walk-away window BEFORE the go-home is dispatched**, never after: the whole
+     *     point is to be in place when the blocked app's window resurfaces, and that can happen on
+     *     the very next frame;
+     *  4. dispatch the go-home;
+     *  5. schedule the fail-safe.
+     *
+     * There is deliberately no [Effect.Finish]. `finish()` on this singleInstance activity pops
+     * straight back to the task underneath — the blocked app — and `GLOBAL_ACTION_HOME` is
+     * dispatched asynchronously, so an inline finish was in a race it could lose. On a device where
+     * the pop won, the blocked app genuinely resumed, fired a real window event, and the service
+     * re-blocked it. [onStopped] finishes us instead, once the launcher has genuinely stopped this
+     * activity, and a finish from the background pops nothing forward.
+     *
+     * There is also deliberately no [Effect.GrantPassthrough]: turning around is not permission to
+     * enter, so the next attempt gets a fresh, full block.
+     *
+     * @param attributedPackage the app the block is recorded against (the rule's app; for a web
+     *   block that is Instagram, not the browser).
+     * @param walkAwayPackage the package the user is sitting IN — the BROWSER for a web block —
+     *   because that is whose window is about to resurface underneath the finishing overlay, and
+     *   whose re-entry must not be read as a fresh arrival.
+     * @param redirectPackage the user tapped their redirect app rather than "I changed my mind": the
+     *   walk-away is IDENTICAL (one row, the same once-only gate, the window armed first, no grant,
+     *   the same fail-safe) and only the destination differs, [Effect.LaunchRedirectApp] in the slot
+     *   [Effect.GoHome] would take. Null or blank goes home. That app's window arriving is a
+     *   departure in its own right (`BlockLaunchGate.walkAwayAfter` closes on any other app's
+     *   window), and `onStopped` finishes us from the background exactly as it does for the
+     *   launcher. The redirect wins over [escapeBrowser]: the user named where they want to be.
+     * @param escapeBrowser set for a WEBSITE block ([WebBlockEscape.browserToEscape]): the browser
+     *   whose tab is still on the blocked page. The walk-away then leaves through
+     *   [Effect.LeaveBlockedPage] instead of [Effect.GoHome], and **does not arm the walk-away
+     *   window**. That omission is the point, not an oversight: the window suppresses blocks for
+     *   the package being left, and here that package is the destination. If the browser comes
+     *   forward still showing the blocked URL it must be blocked at once (fail closed), never let
+     *   through for 1.5 seconds. Going home leaves the tab on the URL, which is issue #78: the
+     *   browser re-blocks on every launch, forever, under a HARD_BLOCK that never grants a pass.
+     */
+    fun onWalkAwayRequested(
+        attributedPackage: String,
+        blockMode: String,
+        walkAwayPackage: String,
+        redirectPackage: String? = null,
+        escapeBrowser: String? = null
+    ): List<Effect> {
+        if (walkedAway) return emptyList()
+        walkedAway = true
+        val record = Effect.RecordWalkAway(attributedPackage, blockMode)
+        val failSafe = Effect.ScheduleFailSafeFinish(renderToken, WALK_AWAY_FINISH_FAILSAFE_MS)
+        val redirect = redirectPackage?.takeIf { it.isNotBlank() }
+        val browser = escapeBrowser?.takeIf { it.isNotBlank() }
+
+        if (redirect == null && browser != null) {
+            leavingPage = true
+            return listOf(
+                record,
+                Effect.MarkOverlayInactive,
+                Effect.LeaveBlockedPage(browser, fallback = goHomeTail(walkAwayPackage)),
+                failSafe
+            )
+        }
+
+        val destination = redirect?.let { Effect.LaunchRedirectApp(it) } ?: Effect.GoHome
+        return listOf(
+            record,
+            Effect.MarkOverlayInactive,
+            Effect.ArmWalkAwayWindow(walkAwayPackage),
+            destination,
+            failSafe
+        )
+    }
+
+    /**
+     * The ordinary walk-away departure, window first: what a web walk-away falls back to when its
+     * escape cannot be performed. The fail-safe is not repeated; the one already scheduled covers it.
+     */
+    private fun goHomeTail(walkAwayPackage: String): List<Effect> =
+        listOf(Effect.ArmWalkAwayWindow(walkAwayPackage), Effect.GoHome)
+
+    /**
+     * The scheduled fail-safe fired: the dispatched go-home never stopped us.
+     *
+     * Refused when the activity is already on its way out, and when [token] is not the CURRENT
+     * [renderToken] — a new block delivered through `onNewIntent` during the transition must not be
+     * killed by the previous attempt's timer; that block belongs to a different app or a different
+     * rule and the user has not walked away from it.
+     *
+     * **[Effect.ArmWalkAwayWindow] comes before [Effect.Finish], and that is the whole point.** This
+     * finish is the old #26 bug reproduced deliberately: it pops the blocked app forward, that app
+     * fires a real window event, and the only thing that stops the service re-blocking an app the
+     * user just declined is the walk-away window. Armed only at the tap, the window had whatever was
+     * left of 1500ms minus the 1200ms spent waiting — 300ms for the pop, the app's resume and its
+     * window event to all land, on precisely the slow devices that reported #26 in the first place.
+     * Re-arming measures the window from the event it is actually about.
+     *
+     * **After a web escape it goes home first instead.** Finishing would pop the browser forward on
+     * the very page the escape was meant to leave. The browser never came forward (or the overlay
+     * would have been stopped), so the escape did not happen; fall back to the ordinary walk-away
+     * once, with a fresh fail-safe behind it, and the next firing is the plain finish below.
+     */
+    fun onFailSafeFired(
+        token: Int,
+        isFinishing: Boolean,
+        isDestroyed: Boolean,
+        walkAwayPackage: String
+    ): List<Effect> = when {
+        isFinishing || isDestroyed || token != renderToken -> emptyList()
+
+        leavingPage -> {
+            leavingPage = false
+            listOf(Effect.LogFailSafeFired) +
+                goHomeTail(walkAwayPackage) +
+                Effect.ScheduleFailSafeFinish(renderToken, WALK_AWAY_FINISH_FAILSAFE_MS)
+        }
+
+        else -> listOf(
+            Effect.LogFailSafeFired,
+            Effect.ArmWalkAwayWindow(walkAwayPackage),
+            Effect.Finish
+        )
+    }
+
+    /**
+     * This instance is gone.
+     *
+     * The dismissal is IDENTIFIED by [overlayId], never unconditional: a replacement instance is
+     * already on screen by the time a finished one is destroyed, and clearing its pending overlay
+     * from here is the third mechanism of issue #36.
+     */
+    fun onDestroyed(): List<Effect> =
+        if (handedOff) {
+            // The fullscreen replacement owns the overlay id and the active flag now.
+            listOf(Effect.CancelPendingFailSafe)
+        } else {
+            listOf(
+                Effect.CancelPendingFailSafe,
+                Effect.MarkOverlayInactive,
+                Effect.ReportOverlayDismissed(overlayId)
+            )
+        }
+
+    /**
+     * The block screen was found in a split-screen half, a floating window or PiP, and
+     * [OverlayWindowMode.decide] said relaunch (issue #71). Hands the block to a fullscreen
+     * replacement; see [handedOff] for why this instance then goes quietly.
+     */
+    fun onRelaunchingFullscreen(): List<Effect> {
+        if (handedOff) return emptyList()
+        handedOff = true
+        return listOf(Effect.RelaunchFullscreen)
+    }
+
+    /**
+     * The replacement could not be started. This instance is the block again, so its stop and
+     * destroy report as they always did, and the service re-blocks from the next window event.
+     */
+    fun onRelaunchFailed() {
+        handedOff = false
+    }
+}

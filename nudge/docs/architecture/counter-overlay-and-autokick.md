@@ -1,0 +1,493 @@
+# Counter overlay, time-remaining overlay and auto-kick
+
+> **WHAT FEEDS THE COUNTER CHANGED IN v1.16.0 — read `accessibility-event-pipeline.md` for that
+> half.** Issue [#28](https://github.com/astraedus/nudge/issues/28): the counter was counting EVENT
+> RATE (one per `TYPE_VIEW_SCROLLED` past a 500ms debounce, plus one per second of
+> `TYPE_WINDOW_CONTENT_CHANGED` for unsupported packages), so one slow drag scored 5-6 and an
+> untouched phone scored anything at all. It now counts item transitions from the scroll event's own
+> `fromIndex`/`currentItemIndex`, the content-change proxy is gone, taps count in every app, and
+> `InAppDetector.SUPPORTED_PACKAGES` no longer gates counting — it supplies the LABEL only. A session
+> counts ONE unit (`CountMode.ITEMS` or `CountMode.TAPS`), never a mixture. Everything below about
+> what the counter FEEDS — the overlay, both auto-kick triggers, the cooldown, the cache — is
+> unchanged.
+
+Covers the floating interaction counter, the time-remaining overlay, both auto-kick triggers
+(interaction count and foreground minutes), the auto-kick cooldown, and the duration inputs that configure them.
+**Read before touching `service/` overlay code, `InteractionTracker`, `CounterCacheRefresher`, `AutoKick*`, or `ui/components/DurationInput.kt`.**
+
+## Feature summary
+
+- **Floating interaction counter** — centered touch-through overlay (40sp counter, 16sp label, 13sp daily) showing reels/shorts scrolled or taps per session. Escalating colors: white (0-9), orange (10-19), deep orange (20-29), red with red background tint (30+). TYPE_ACCESSIBILITY_OVERLAY from service, no extra permission. Per-rule `showCounter` toggle (default ON for new rules).
+- **Time remaining overlay** — per-rule opt-in (`showTimeRemaining`). Displays "42m left" or "1h 12m left" below counter, color-coded: green (>50% remaining), orange (25-50%), red (<25%). Uses UsageStatsManager for actual foreground time. Requires daily limit to be set. **The readout and the enforcement of the limit behind it are two different questions** (`showTimeRemaining` decides the first, a limit existing at all decides the second) — see "Why a plain daily limit needed its own clock, v1.18.4".
+- **Auto-kick** — optional per-rule feature: sends user to home screen after N scrolls/taps in one session. Configurable threshold 5-100 (step 5, default 30). Session counter resets after kick. Stored as `autoKickAfter` on BlockRule. Requires the interaction counter (it is what feeds the count).
+- **Auto-kick by time (v1.10.0)** — the second trigger, per-rule `autoKickAfterMinutes` (null = off). Kicks after N minutes of foreground time in one session. Independent of the interaction trigger — both can be set, whichever fires first kicks — and independent of the interaction counter, because its whole point is PASSIVE use (autoplaying video produces zero tap/scroll events). See "Time-based auto-kick architecture".
+- **Auto-kick cooldown** — configurable per-rule, stored as `autoKickCooldownSeconds` on BlockRule. After auto-kick, returning to the app forces a DELAY overlay for the remaining cooldown. Session counter preserved during cooldown. **v1.10.0**: the 0-300s slider became a free-form MINUTES input (0-1440), so issue #6's "30 minutes on, 15 minutes off" is expressible. See "Duration inputs".
+- **Usage reminder (#77)**, per-rule `remindAfterMinutes` (null = off): ONE notification after N minutes of session foreground time, on the time kick's clock and session, never instead of it. The kick wins when it is at or below the reminder. See "Usage reminder" at the end.
+- **Every kick is also a "wall" for the bounce check-in (v1.21.0).** `AutoKickExecutor.kick` reports the kicked key through `onKicked` (a `web:<domain>` key is mapped back to the browser the user was in, plus its domain). The executor itself does nothing different. See `docs/architecture/bounce-check-in.md`.
+
+> **The overlays' windows are part of the event pipeline, not just pixels.** Both are
+> `TYPE_ACCESSIBILITY_OVERLAY` windows owned by Nudge, so adding one — or setting a
+> `TextView`'s text inside one — emits an accessibility event carrying our own package. Until
+> v1.17.3 that was read as "Nudge is in front", which moved the block gate's foreground to Nudge
+> and stopped a daily limit enforcing for as long as the user sat still
+> ([#41](https://github.com/astraedus/nudge/issues/41)). Every view in both overlays is therefore
+> an `AwarenessOverlayWindow` type, reporting one derived accessibility class name that
+> `EventClassifier` recognises. **Never construct a bare `TextView`/`LinearLayout` in these
+> managers** — `AwarenessOverlayContractTest` fails on it, and the reason is in
+> `docs/architecture/accessibility-event-pipeline.md`, "Our own windows are three different things".
+
+## Counter overlay architecture
+
+- `InteractionTracker` (@Singleton): in-memory session/daily counts per package. No DB writes per interaction. Also tracks cooldown state per package after auto-kick.
+- `CounterOverlayManager` (@Singleton): WindowManager overlay using service context (required for TYPE_ACCESSIBILITY_OVERLAY token). `setServiceContext()` called in `onServiceConnected()`. Centered on screen with escalating colors (white -> orange -> deep orange -> red) based on session count.
+- `TimeRemainingOverlayManager` (@Singleton): Standalone floating overlay in top-right corner. Shows "Xm left" with color-coded text (green >50%, orange 25-50%, red <25%) and increasingly opaque background. Separate from counter overlay so both can show independently.
+- `activeReelLabel`: once Shorts/Reels feature detected, skip tree inspection on subsequent scrolls. Reset on app switch.
+- Tracked packages cached every 10s via `CounterCacheRefresher` (Map<String, CounterCacheEntry> with showCounter, autoKickAfter, showTimeRemaining, dailyLimitMinutes, autoKickCooldownSeconds, autoKickAfterMinutes per package). A rule enters the cache if it wants **any** of: the counter, the time-remaining overlay, a time-based auto-kick, or (**v1.18.4**) a daily time limit on its own — a budget needs the foreground clock to be enforced mid-session, not only on re-entry; see "Why a plain daily limit needed its own clock, v1.18.4". **Since #146 the cache is keyed by every package a rule COVERS, not only by the packages rules name**: a group rule's members and an All apps rule's apps get the rule's entry too, resolved by `RuleCoverage` exactly as block evaluation resolves them (`CounterCacheCoverage`; see "Group and All apps rules get the clock too, #146"). `mergeEntries` collapses multiple rules per package to the strictest reading (lowest thresholds, any overlay wins, and the longest cooldown among the entries that configure a kick).
+- **`hasEntry` vs `isCounterEnabled` (v1.10.0)** — these are different questions and conflating them is a bug. `hasEntry` = "this package is tracked at all" (drives foreground/session bookkeeping); `isCounterEnabled` = `showCounter`, and is the ONLY thing that may draw or feed the interaction counter. Before the split, cache membership implied a counter, so a rule that only wanted a time-based kick (or only the time-remaining overlay) would have switched on a floating tap counter the user never asked for. Guarded by `InteractionHandlerTest."a package tracked only for a time-based kick gets no counter overlay"`. **v1.18.4 widened the question again**: a plain daily limit now puts a package in the cache too, so cache membership no longer implies the counter, the time-remaining overlay, OR an auto-kick — it implies only "something here needs the foreground clock". `CounterCacheEntry.configuresAutoKick` (`autoKickAfter != null || autoKickAfterMinutes != null`) is now the narrower, separate question "can anything here actually kick", and `NudgeAccessibilityService.hideUnwantedAwarenessOverlays` asks the entry directly what it wants rather than testing membership, for the same reason. See "Why a plain daily limit needed its own clock, v1.18.4".
+- Auto-kick: two triggers, ONE kick. `AutoKickExecutor.kick(pkg, reason)` is the single place the kick happens — arm cooldown, go home, `resetSession`, hide the counter — so the interaction trigger (`InteractionHandler`) and the time trigger (`AutoKickTimeHandler`) can never drift in what they do to the user. It takes a `goHome` lambda rather than building the Intent itself, which keeps the policy JVM-testable and lets the service prefer `requestGoHome()` (accessibility `GLOBAL_ACTION_HOME`) over a HOME intent, as `EmergencyPassManager` already does.
+- Auto-kick cooldown: configurable per-rule (default 60s). After auto-kick, re-opening the app shows a DELAY overlay for the remaining cooldown. Session counter NOT reset during cooldown.
+- Time remaining overlay: optional per-rule (`showTimeRemaining`). Uses UsageStatsManager to get actual foreground time, displays remaining daily limit as color-coded overlay line.
+
+## Time-based auto-kick + the foreground-time clock — v1.10.0 (fixes #6)
+
+Fix for [#6](https://github.com/astraedus/nudge/issues/6): "kick you out of the app on a timer and then lock the app for x amount of time … use an app for 30 minutes, then block it for 15 minutes."
+
+Built by EXTENDING the auto-kick machinery, not beside it: the new trigger feeds the same `AutoKickExecutor`, the same `autoKickCooldownSeconds`, the same cooldown DELAY overlay on re-entry, and the same session reset.
+
+**The clock had to be built.** The pre-existing "30s updates" of the time-remaining overlay were a 30s *debounce* on event-driven calls (`TimeRemainingHandler.maybeUpdate` was only reached from an interaction or an app-entry) — there was no timer anywhere in the service. That is fine for counting taps and useless for passive watching, which is exactly the case #6 is about. It also meant the **daily-limit HARD_BLOCK could be late** for a passively-watched app; driving it from the new tick fixes that too.
+
+- **`domain/autokick/TimeKickEvaluator.kt`** — pure Kotlin. `evaluate(thresholdMinutes, baselineUsageMs, currentUsageMs)` -> `DISABLED | START_SESSION | WAIT | REBASELINE | KICK`. A null/0/negative threshold is DISABLED (a stored 0 must never mean "kick after 0 minutes"); a reading BELOW the baseline is REBASELINE, not a kick (the daily total resets at midnight, and a negative elapsed time is not evidence of overstaying).
+- **The session marker** lives in `InteractionTracker` alongside the interaction count: `sessionUsageBaseline[pkg]`, the `UsageProvider.getDailyForegroundTimeMs` reading taken when the session began. Elapsed session time = current reading − baseline. This choice does the work for free: `getDailyForegroundTimeMs` sums ACTIVITY_RESUMED→PAUSED spans, so **time in other apps and time with the screen off are simply not in the reading** — no wall-clock bookkeeping, no stint accounting.
+- **Session semantics — deliberately identical to the interaction counter's.** The baseline is cleared in exactly the same branches that zero `sessionCounts`: on `onAppChanged` when the user has been away ≥ `SESSION_EXPIRY_MS` (5 min) and is not in cooldown, and on `resetSession` (which the kick calls). So a quick tab-out-and-back CONTINUES the budget (closing the obvious bypass), a real break restarts it, and the two triggers can never disagree about whether this is still the same sitting. Pinned by `InteractionTrackerTest` + `AutoKickTimeHandlerTest`.
+- **`service/AutoKickTimeHandler.kt`** — reads the clock, advances/repairs the baseline, returns whether to kick. Deliberately does NOT kick: it runs off-main (the usage read is a binder call) while the kick touches the WindowManager, so the caller hops to Main. A failing usage read returns false — an unreadable clock must never eject a user.
+- **`NudgeAccessibilityService.updateForegroundTimeTicker(pkg)`** — starts one 30s coroutine per foreground app, but ONLY when `CounterCacheEntry.needsForegroundTimeTick` (a minutes threshold, or — **v1.18.4** — any daily limit at all, readout or not; see "Why a plain daily limit needed its own clock, v1.18.4"); a counter-only package spins no timer. Idempotent per package, because `evaluateForegroundPackage` is re-entered on debounced events and the issue #7 content-change fallback — restarting the job each time would keep resetting the `delay` and the clock would never tick. Started **before** the emergency-pass / cooldown / passthrough early-returns (a user who just completed a delay is precisely who this is for); stopped in `clearOverlays`, `hideAllOverlays`, `onDestroy` and immediately after a kick.
+- **Each tick** re-checks `globalEnabledCached` and `EmergencyPassManager.isPassActive` (a timer is not covered by the synchronous event gate, and the daily pass promises uninterrupted minutes), then feeds the kick check and `timeRemainingHandler.maybeUpdate`.
+- **Granularity**: a kick can overshoot its threshold by up to one tick (30s). Acceptable against thresholds measured in minutes, and cheaper than a tighter poll on the 3GB Pixel 3.
+- **Scope**: time-kick is APP-level only — no per-feature (Reels/Shorts) minutes input, because the cache is keyed by package and a per-feature threshold would leak to the whole app.
+- **Tests**: `TimeKickEvaluatorTest` (every branch incl. zero-threshold and midnight rollover), `AutoKickTimeHandlerTest` (baseline lifecycle, quick-return does not reset, real break does, cross-package isolation, failing read never kicks), `CounterCacheRefresherMergeTest` (merge + `needsForegroundTimeTick`), `InteractionHandlerTest` (shared executor; time-kick-only package gets no counter).
+
+## Duration inputs (`ui/components/DurationInput.kt`) — v1.10.0
+
+The auto-kick cooldown and the new minutes threshold are free-form numeric fields in MINUTES (0-1440), replacing the old 0-300s slider. The **UI state holds the raw String**, not an Int, so a blank field round-trips as blank ("off") instead of snapping back to "0".
+
+- Storage is unchanged: `autoKickCooldownSeconds` is still seconds. `DurationInput` owns the one conversion.
+- **Display rounds UP** (`cooldownSecondsToText`): the old slider was `steps = 5` over `0f..300f`, which Compose resolves to the seven stops **0/50/100/150/200/250/300** — the old code comment claiming 0/60/120/… was wrong — so 50s and 150s cooldowns exist in the wild and a minutes field can only show them rounded. Rounding down could shorten protection; 50s showing as "0" would read as off.
+- **Rounding never reaches storage.** `resolveCooldownSeconds(text, originalSeconds)` / `resolveMinutes(text, originalMinutes)` return the ORIGINAL value verbatim when the field still reads what was rendered for it, so a save that did not touch the field re-persists the exact prior value. Both editors carry `original…` fields in state for this. It matters because `RuleWeakening` treats a lowered cooldown as a weakening: without it, opening an editor and saving an unrelated change could rewrite 150s→180s and raise a spurious Strict Mode challenge later.
+- Turning auto-kick off PRESERVES the stored cooldown (it used to snap back to 60s) for the same reason.
+- The legacy `RuleEditorViewModel` (and its `buildRule` / `RuleEditorRuleBuilderTest`) was deleted as dead code; `UnifiedAppConfigViewModel` is the one save path.
+
+## Websites get the time trigger too, v1.15.2
+
+The auto-kick machinery is keyed by an opaque `String`, never by a real package, and v1.15.2 uses
+that: a blocked website is tracked as a foreground "package" named `web:<domain>`
+(`domain/web/WebSessionKey.kt`), so `CounterCacheRefresher`, `InteractionTracker`'s
+session/baseline/cooldown maps, `TimeKickEvaluator`, `AutoKickTimeHandler` and `AutoKickExecutor` all
+work on it **unchanged**. Full rationale, and the three passthrough bugs found alongside it, are in
+`web-domain-blocking.md`; what matters here is what it does to this subsystem:
+
+- `CounterCacheRefresher.webEntriesFor` emits one entry per configured domain, and only when the
+  rule's resolved WEB mode actually blocks (#21) and it carries an `autoKickAfterMinutes`. So the
+  cache now holds two kinds of key, and `mergeEntries` treats them identically.
+- Those entries deliberately set `showCounter = false` and `showTimeRemaining = false`. The counter
+  is fed by `TYPE_VIEW_CLICKED`/`TYPE_VIEW_SCROLLED`, which arrive carrying the **browser's**
+  package, so an interaction cannot be attributed to a site; and the time-remaining overlay needs a
+  daily web total that does not exist (`docs/BACKLOG.md`). This is the `hasEntry` vs
+  `isCounterEnabled` split doing its job, a package can be tracked for a clock without ever drawing
+  a counter.
+- The clock behind a `web:` key is the BROWSER's `getDailyForegroundTimeMs`, redirected by
+  `WebSessionUsageProvider`. The session delta therefore still excludes time in other apps and time
+  with the screen off, exactly as the app path's does.
+- The web clock runs on its own `webTimeJob` in the service, NOT `foregroundTimeJob`. Browsers are
+  not in the counter cache under their own package, so every browser window event runs
+  `clearOverlays → stopForegroundTimeTicker()`; sharing the job would tear it down and restart it
+  (re-reading usage) on each one.
+- The cooldown after a web kick is armed on the domain's key. Arming it on `com.android.chrome`
+  would lock every website the user has, which is the same over-blocking mistake as treating
+  `CATEGORY_HOME` as "launcher".
+- Tests: `CounterCacheWebEntriesTest` (9), `WebSessionUsageProviderTest` (5),
+  `WebDomainEnforcementContractTest` (8, source-level).
+
+## Why the time-based auto-kick was unreliable, v1.15.2
+
+Device QA: a rule with a 2-minute time trigger, sat on for 2m20s, no kick. Logcat showed
+`session baseline set … threshold=2min` **once** and then nothing, on the web path AND on the native
+app path. It was reported as "the time auto-kick is dead", but it was never one bug, it was three,
+and the third is why the first two survived so long.
+
+**The app path was NOT a regression from the web-domain work** (verified at source level: those
+commits touch none of `AutoKickTimeHandler`, `InteractionTracker`, `TimeKickEvaluator`,
+`UsageRepository`, and their only hits in the service are doc comments). It has been fragile since
+the trigger shipped in v1.10.0, and v1.10.0's device QA passed because it happened not to hit the
+window where it breaks.
+
+### 1. Transient system windows stopped the clock
+
+`onAccessibilityEvent`'s `SYSTEM_PACKAGES` branch called `clearOverlays`, which called
+`stopForegroundTimeTicker()`. `SYSTEM_PACKAGES` is the notification shade, permission dialogs, the
+installer and the launcher, and the clock stopped for **all** of them. A heads-up notification
+ended a running session's clock, and nothing restarted it until the next foreground
+*re-evaluation*, which for a **browser never arrives from content changes at all**
+(`handleWindowContentChanged` returns early on the browser branch). Minutes simply stopped accruing.
+
+This is the *same grouped-constant trap* `SYSTEM_PACKAGES` already sprang on the passthrough grant
+(`foreground-detection.md`): one membership test answering two different questions, "should the
+awareness overlays go away" and "has the user stopped looking at this app". The launcher branch
+already knows how to tell "went home" from "transient", so `clearOverlays` gained an explicit
+`stopClocks` parameter and the system branch passes the answer it already computed.
+
+### 2. One throwing tick ended the clock permanently, in silence
+
+Both clocks were inline `while (isActive) { tick(); delay(30_000) }` loops on a `SupervisorJob`
+scope. The body reaches a binder read and the WindowManager; `AutoKickTimeHandler` guards only its
+own usage read, so anything else throwing left the loop **for good**, the throwing child died
+alone, the scope survived, and nothing logged it or restarted it.
+
+`service/ForegroundClock.kt` now owns the loop for both clocks: idempotent per key, immediate first
+tick, **per-tick exception guard**, and start/stop/exit logged unconditionally with a reason.
+`ForegroundClockTest` pins it, including a witness test that reproduces the old inline shape and
+asserts it dies after one tick while the guarded one survives the identical failure.
+
+### 3. Nothing was observable, which is why this took a device cycle to even localise
+
+Four separate paths returned `false` with **no log**: `shouldKick`'s missing-cache-entry
+`?: return false`, both gates in `tickForegroundTime`, and, the important one, 
+`TimeKickEvaluator.WAIT`. WAIT is the branch a *healthy* clock spends its whole session in. So
+"the clock is ticking and hasn't reached the threshold" and "the clock has been dead for ten
+minutes" produced **identical logcat: nothing**, and QA correctly could not tell them apart.
+
+This is the v1.12.0 picture-in-picture failure again, one subsystem over ("detection fired but
+stayed silent" vs "detection never fired" being indistinguishable cost a whole release cycle). The
+WAIT branch now logs `elapsed`, `threshold` and the raw `usage` reading, and the missing-entry case
+says so. That makes the next device run conclusive in one pass: **no WAIT lines at all ⇒ the clock
+is dead; WAIT lines whose `elapsed` never grows ⇒ the reading is the problem.**
+
+### 4. …and the reading itself was the fourth copy of a loop that was supposed to be gone
+
+`UsageRepository.getDailyForegroundTimeMs`, the clock behind *both* the auto-kick and daily budgets
+, was still its own `queryEvents` walk. v1.15.1 collapsed three copies of that pairing loop into
+`ForegroundSpanTracker` after the 17-hour-day incident, but this one lives outside
+`ScreenTimeProvider`, so both the sweep and `ScreenTimeSourceContractTest` missed it. It carried both
+defects that fix exists to remove: it filtered the stream **before** pairing (`if (event.packageName
+!= packageName) continue`, so it could not see the event that ends this app's span, another app
+coming forward) and it extended a still-open span to now **uncapped**. One dropped `ACTIVITY_PAUSED`
+was therefore worth every minute since. On this code path that reads as a kick firing out of
+nowhere, which matches the unexplained cooldown QA saw late in a long session. It now delegates to
+`ScreenTimeProvider.getPerAppSessionStats`, so there is one interpretation of the event stream in the
+app, with the capped-inference and one-app-at-a-time guarantees.
+
+## Why a plain daily limit needed its own clock, v1.18.4
+
+Measured on the bench: Calculator on a plain 1-minute daily limit (`mode=NONE`,
+`showTimeRemaining=false`, no time-based auto-kick), 150 seconds of continuous foreground time,
+**exactly ONE evaluation** — at t=0. The budget was never re-read, so a user who never switched away
+could sit past it indefinitely; leaving and coming back tripped it immediately. `docs/BACKLOG.md` had
+this open as a product-decision-owed item since 2026-09-29 ("route mid-session enforcement through the
+tick path, or document re-entry as intended"). The product call landed the same day: "daily limits
+should definitely be enforced even mid session."
+
+**Why the gate excluded a plain limit.** `needsForegroundTimeTick`'s two arms were the features that
+DISPLAY a running number — the time-based auto-kick and `showTimeRemaining && dailyLimitMinutes !=
+null` — so the predicate read as "who needs the number refreshed", and a limit with neither an overlay
+nor an auto-kick satisfied neither arm. The enforcement itself was never missing: `TimeRemainingHandler`
+already hard-blocked at zero remaining, on the tick path. Nothing was driving the tick for this shape
+of rule. The fix subsumes rather than adds a third arm — `dailyLimitMinutes != null` on its own,
+because `showTimeRemaining && dailyLimitMinutes != null` can no longer be true without the new arm
+also being true, and spelling it out twice would be a condition that never decides anything. The cache
+loader's own filter (`loadCounterCacheEntries`'s `appEntries` predicate) needed the identical widening,
+for the same reason `hasEntry` was widened above: without an entry, `updateForegroundTimeTicker` has
+nothing to read for the package at all.
+
+**`TimeRemainingHandler.maybeUpdate`'s two conditions had been merged into one, and that was the other
+half of the bug.** The readout needs `showTimeRemaining`; the enforcement needs only a limit to exist.
+Both used to sit behind `showTimeRemaining && dailyLimitMinutes != null`, which is why a plain limit
+was invisible to the clock in two places at once (the cache arm above, and this check). They are now
+two separate reads of `entry.dailyLimitMinutes`: one gates whether the "42m left" overlay is drawn or
+cleared, the other gates the daily-usage read and the zero-remaining block, unconditionally. A
+completed delay/hold/breathing passthrough grant is cleared **before** the block launches — the grant
+only suppresses the event-driven evaluation path (`shouldSkipForegroundEvaluation`), and nothing on
+the tick path consulted it, so without this a user would meet the block here and then walk straight
+back into the app on the next event. **Since #192 the clear lives in `enforceExhaustedBudget`, after
+the HARD_BLOCK is confirmed and before `handleDecision`**, not in the tick: a spent budget does not
+always block what is on screen (below), and clearing on every tick revoked a finished website delay
+every 30 seconds on a page nothing blocked.
+
+**The clock REPORTS, it does not enforce — and that is what fixed the missing row.** The daily-limit
+`HARD_BLOCK` used to log no `UsageEvent` at all (the overlay-launch-paths gap in `docs/BACKLOG.md`),
+and the reason was structural rather than an oversight: this path was a SECOND implementation of
+"block this app". It first started `BlockOverlayActivity` itself (outside the launch gate, issue #31),
+then built its own `launchBlockOverlay` call inside the service — and a second implementation is the
+thing that drifts. `TimeRemainingHandler`'s callback now hands the FACT back and
+`NudgeAccessibilityService.enforceExhaustedBudget` re-evaluates:
+
+- **Re-derive, never trust the snapshot.** The trigger is read off `CounterCacheRefresher`, a
+  10-second snapshot, so "the budget is spent" can be up to ten seconds stale. Acting on it directly
+  is [#50](https://github.com/astraedus/nudge/issues/50)'s own shape from the other side: a user who
+  has just RAISED their limit, or switched the rule off, would be blocked with the old one, from a
+  timer, having done nothing. `EvaluateBlockUseCase` re-reads the rules, the schedule window, the
+  enabled flag and the usage total, all current. (It reads the budget from the same
+  `UsageRepository.getDailyForegroundTimeMs` the trigger does, so the two can only disagree about the
+  LIMIT, never about the minutes.)
+- **A browser is re-derived the way its entry path derives it (#192).** A rule set directly on a
+  browser is websites-only at entry (`web-domain-blocking.md`, "Browsers in a group"). The clock used
+  to call `invoke(browser)` with every rule, so a spent limit on Chrome's own rule took the
+  `time_budget_exceeded` branch as an APP and hard-blocked all of Chrome on any site, again on every
+  reopen. `EvaluateBlockUseCase.evaluateSpentBudget(pkg, browser, urlBarText)` now routes a
+  non-nuked browser like `evaluateBrowser`: a group or All apps rule covering it whole is evaluated
+  as an app (`excludeDirectRules`) and blocks the browser only on a HARD_BLOCK; otherwise the URL on
+  screen goes through `evaluateWebDomain`, so only the rule's own sites are blocked, as website
+  blocks. An unreadable URL blocks nothing. Apps and a nuked browser get `invoke` as before. Tests:
+  `EvaluateSpentBudgetTest` (L3, 5 of its 10 cases fail with the old `invoke` call),
+  `SpentBudgetBrowserContractTest` (the call and the clear's position).
+- **It may only ESCALATE to a HARD_BLOCK.** If the re-evaluation comes back DELAY/HOLD/BREATHING —
+  i.e. the budget is not actually spent — it does nothing and says so
+  (`daily limit NOT enforced … reason=rules_disagree`). Putting a countdown in front of someone who is
+  already inside the app and has touched nothing would be a worse bug than the one this fixes; same
+  fail-toward-nothing direction as the rest of the clock.
+- **Everything else comes free**, which is the point: the launch gate, grayscale, the
+  `claimConfrontation` arrival invariant and the `wasBlocked` row are `handleDecision`'s, unchanged.
+  So the row is ONE per arrival however many times the clock re-fires, and the claim refuses a ROW
+  and never a block — someone still sitting in an exhausted budget goes on meeting the limit screen,
+  they are just not counted again for it (issue #36).
+- There are now THREE `launchBlockOverlay` call sites, not four (`BlockOverlayLaunchContractTest`
+  floors it at three): the rule block, the auto-kick cooldown, the web auto-kick cooldown. **Stat-semantics consequence, stated plainly**: from v1.18.4 on, daily-limit blocks
+appear in the dashboard "Blocked" tile and the insight pages; history from before this version does
+not contain them, so a week spanning the upgrade is not comparable to one entirely on either side of
+it. The auto-kick cooldown's DELAY overlay is the other of the two paths that gap named, and it still
+logs nothing — left open in `docs/BACKLOG.md`, deliberately, because fixing it changes stat semantics
+again and is its own product call.
+
+**`CooldownGate`'s authority narrowed, because the widened cache made its old authority wrong.** It
+used to be "the counter cache holds an entry for this package" — a good enough proxy while everything
+in the cache was an auto-kick or an awareness overlay. Once a daily limit alone earns an entry,
+membership no longer answers "can anything here kick" — a user who turned auto-kick off while keeping
+a daily limit would still have "an entry", and the armed cooldown would have gone on ejecting them from
+an app nothing is configured to kick out of any more. `CounterCacheEntry.configuresAutoKick`
+(`autoKickAfter != null || autoKickAfterMinutes != null`) is the narrower, and now only, evidence; both
+call sites (the app path in `evaluateForegroundPackage` and the web path in `enforceWebCooldown`)
+read it instead of bare membership.
+
+**Awareness overlays needed the same correction.** `clearOverlays` already hid both overlays for a
+package with *no* cache entry; nothing hid them for a *tracked* package that wants neither — reachable
+before v1.18.4 only for a time-kick-only rule, and far more common now that a plain daily limit is
+tracked too. Walking from an app with the counter showing into one with only a budget left the
+previous app's counter floating on top of it. `hideUnwantedAwarenessOverlays` closes this by asking
+the entry what it wants (`isCounterEnabled`, `showTimeRemaining`) rather than testing membership — the
+same "ask the entry, don't infer from `hasEntry`" correction the `configuresAutoKick` split makes.
+
+**A REBIND USED TO END THE CLOCK FOR THE REST OF THE SITTING, and the new device case found it.**
+The clock is only ever started from `evaluateForegroundPackage`, i.e. from a window EVENT. A user
+sitting still produces none, and a rebind destroys the service instance and cancels the clock with
+it — so from that moment until they next switched apps there was no clock at all. Silent in every
+sense: nothing logged, nothing on screen, the time-based auto-kick simply stopping. Measured while
+building `daily-limit-midsession`, where one UI-tree dump from the harness was enough to cause it:
+
+```
+15:17:44.905  adbd … 'ui automator dump …'
+15:17:45.634  app clock stopped key=…calculator reason=service_destroyed
+15:17:46.806  accessibility service connected
+              (no clock again for the remaining 100 seconds of the sitting)
+```
+
+`onServiceConnected` now calls `restartForegroundClockAfterRebind()`, which reads the LIVE window
+(`rootInActiveWindow`, because a rebind is a new instance with no remembered `lastPackage`) and
+restarts the clock if that package needs one — **after** the eager `forceRefresh`, since before it
+the cache is empty and the restart would silently do nothing. The CLOCK only, never a full
+re-evaluation: a rebind is not evidence the user did anything, which is exactly the call
+`PassthroughManager.onObservationResumed` already makes, so this restores observation and lets the
+ordinary tick decide, gated and counted like any other block. Pinned by
+`ServiceLifecycleContractTest."a rebind restarts the foreground clock, after the cache is populated"`,
+which asserts the ORDER, because a restart placed before the populate looks like a fix and is not.
+
+This predates v1.18.4 — the time-based auto-kick and the time-remaining overlay have had it since
+v1.10.0 — but a daily limit is a far more common rule shape, so the fix ships with the feature that
+made it matter.
+
+**Granularity, stated where a user can be told it.** Enforcement rides the clock that already exists,
+so the block lands within one `FOREGROUND_TICK_MS` (30s) of the budget crossing zero — the same
+overshoot the time-based auto-kick documents above, and cheaper than a tighter poll on a 3GB Pixel 3.
+The rule editor and the app-config screen now say "the block lands as soon as the budget runs out,
+even if you're still inside the app", which the pre-v1.18.4 behaviour did not support.
+
+**Tests, per layer.** L1: `CounterCacheRefresherMergeTest` (the gate predicate — a plain limit ticks,
+a limit ticks with or without the readout, the merge keeps it ticking, and the COUNTERFACTUAL that a
+rule with no limit / no overlay / no auto-kick still spins no timer, which is the battery half),
+`CooldownGateTest` and `CounterCacheRefresherMergeTest`'s `configuresAutoKick` rows,
+`TimeRemainingHandlerTest` (a plain limit is enforced with no readout drawn; no limit is never
+enforced; the tick itself leaves the grant alone, #192). L2/L3:
+`InterventionCountReplayTest` — the tick path in the #36 row model: one row for a budget that runs out
+mid-session, one row across 40 clock-driven re-launches while `launches` climbs past 40, two rows for
+a genuine leave-and-return. Source level: `BlockOverlayLaunchContractTest` (the clock's callback
+launches, claims and logs NOTHING itself; `enforceExhaustedBudget` re-evaluates and may only escalate
+to a HARD_BLOCK; one `wasBlocked` writer in the service, still). L6:
+`scripts/device-qa.sh daily-limit-midsession`, which sits in Calculator with a derived budget and
+asserts the limit screen arrives without leaving the app, for exactly +1 on the Blocked tile.
+
+## Group and All apps rules get the clock too, #146
+
+**The bug.** v1.18.4 made a daily limit a clock consumer, but the cache that decides which packages
+get a clock was still built from the rules that NAME a package (`CounterCacheRefresher.appEntryFor`,
+one `(packageName, entry)` per rule row). A group rule and an All apps rule name none, so their apps
+had no entry, `updateForegroundTimeTicker` never started a clock for them, and a group's "Daily limit
+for each app" was enforced only when the app was next opened. Bench repro
+([#146](https://github.com/astraedus/nudge/issues/146)): a one-app group, Hard, 2 min/day, the app
+left in front for ~178 s, never blocked, `clock started` never logged. The same hole covered an All
+apps rule carrying a limit (only an imported file can give one a limit today, but the engine honours
+it, so the clock must too). The time-based auto-kick, the time-remaining readout and the usage
+reminder on a group or All apps rule had the same gap, for the same reason.
+
+**The fix: one coverage answer, not a second one.** `service/CounterCacheCoverage.kt` builds the app
+half of the cache from the `RuleSnapshot` (the in-memory rules, groups and memberships evaluation
+reads; see `rule-snapshot.md`):
+
+- Every enabled rule that wants an entry (`CounterCacheRefresher.entryFor`, the same "wants something
+  from the clock or an overlay" predicate as before) is asked, per candidate package, whether it
+  covers that package, through `RuleCoverage.covers` and `RuleCoverage.groupIdsOf` with the
+  snapshot's `GroupMembershipResolver`. That is the resolver `RuleEvaluator`, `WholeAppCoverage` and
+  the Home count already share, so category groups, "Removed by you", essentials (never under a group
+  or All apps rule; an explicit app rule on an essential is still honoured) and a browser joining a
+  group by hand only all come out the same here as in evaluation. Nothing in the cache re-derives
+  membership.
+- Candidates are the set `CoveredApps` enumerates: packages rules name, every group's hand-added apps,
+  and every launchable app (`InstalledAppsRepository`, with its category).
+- Not `DeviceGroupMembers`, deliberately: it reads the tables rather than the snapshot evaluation
+  reads, and it answers group membership only, so an All apps rule would still have had no clock.
+- **Strictest wins**, as in `BlockEngine`: every rule covering an app counts together (rules only add;
+  a group rule never shadows a direct one or the other way round), and `mergeEntries` takes the lowest
+  limit and threshold and any overlay asked for. For a daily limit that is exactly the limit the
+  engine blocks on first. Two groups on one app: the lower limit.
+- **The budget is per app**, as at open time and as the editor labels it ("Daily limit for each
+  app"): `TimeRemainingHandler` compares the app's OWN usage today with the merged limit, the same
+  number `BlockEngine` compares. A shared budget across a group's apps is spec follow-up F3
+  (`docs/exec-plans/active/groups-categories-allowlist.md`), not this.
+
+**Why the agreement matters at runtime, not only in tests.** The clock reports and
+`enforceExhaustedBudget` re-derives through `EvaluateBlockUseCase`, which may only escalate to a
+HARD_BLOCK. A cache that covered an app evaluation does not would log `rules_disagree` on every tick
+and show nothing; one that missed an app evaluation covers is #146 itself. Same resolver, same
+answer.
+
+**Battery (#63).** A package still gets an entry only if a covering rule wants one, and the device
+lists are read only when they can matter (`CounterCacheCoverage.needs`): the essentials list once any
+group or All apps rule wants an entry, the installed-apps list (with the browser list) only for an All
+apps rule or a group that matches by category. A phone with app rules only reads nothing new, and a
+group rule with no clock feature (a plain Delay group) reads nothing and spins no timer.
+
+**Freshness.** Membership edits reach the cache on the same at-most-10-second refresh as rule edits:
+`RuleSnapshotSource` re-emits on any change to the rules, groups or members tables, and the loader
+reads `current()`. The first open within 10 s of an edit can still be judged against the previous
+cache, which is the pre-existing trade-off of the 10-second snapshot (and why the device cases wait
+12 s after a save), not something this changes.
+
+**The cooldown merge had to narrow, because group rows joined it.** `mergeEntries` took the longest
+`autoKickCooldownSeconds` of every entry for a package. A group row with only a limit carries the
+column default (60 s) and configures no kick, so once group rows entered the merge it would have
+stretched a direct rule's 30-second kick cooldown to 60. The longest cooldown is now taken over the
+entries that `configuresAutoKick`, falling back to all of them only when none does.
+
+**Edges, all consistent with evaluation:** an installed app with no launcher entry is covered by a
+group only if it was added by hand (category groups and All apps cover launchable apps only); a rule
+for a deleted group covers nothing; a disabled rule contributes nothing; a corrupt row with no target
+is dropped.
+
+**Tests, per layer.** L1: `CounterCacheGroupEntriesTest` (members get an entry that ticks, "Removed by
+you" gets none, category members by category and never a browser, essentials never under a group but
+a direct rule on one still counts, strictest wins both ways, two groups, a disabled rule, a group with
+no clock feature, a deleted group, All apps with allowed apps and groups, the cooldown merge, and what
+`load` reads for app-only, hand-picked and category snapshots), plus two rows in
+`CounterCacheRefresherMergeTest` (a group row's `entryFor`, the kick-only cooldown). Counterfactual:
+with `appEntries` swapped back to `enabledRules.mapNotNull(appEntryFor)`, 15 of the 21 new tests
+fail. L3: `CounterCacheGroupMidSessionTest` drives the tick end to end (the loader fills a real
+`CounterCacheRefresher`, the real `TimeRemainingHandler` reports the spent limit for the member, and
+the real `EvaluateBlockUseCase` on the same snapshot and usage returns the hard block the re-derive
+needs), with injected usage and a pinned engine clock. `CounterCacheCoverageDriftTest` pins the
+agreement over a mixed fixture: for every package, the cache's daily limit equals the limit the real
+`EvaluateBlockUseCase` blocks on, and the cache's app keys equal `CoveredApps` over the rules that
+want an entry. L6: `scripts/device-qa.sh group-limit-midsession` (group3, the mid-session clock
+chunk) builds a throwaway Hard group through the real editor (Clock, an app with no direct rule
+in the fixture, so only the group can give it a clock), measures today's usage, sets the group's
+limit to usage + 2 minutes, then sits in Clock with no UI dumps. It asserts the
+`reason=daily_limit_reached ... source=foreground_clock` line, the limit screen arriving without
+leaving the app, and exactly +1 on the Blocked tile, and it deletes the group on every exit.
+
+## Usage reminder, "remind me instead of kicking me" (issue #77)
+
+[#77](https://github.com/astraedus/nudge/issues/77): "add a reminder after using the active app for N
+minutes, just a reminder instead of auto-kick". Per-rule `BlockRule.remindAfterMinutes: Int?` (null =
+off, DB 11->12). After N minutes of foreground time in one session, ONE notification ("You've been on
+Instagram for 20 min / Just a heads-up. Still what you came here for?") and nothing else changes: no
+kick, no cooldown, no session reset, the clock keeps running for the kick and the daily limit.
+
+**A separate field, never a mode of the time kick.** "Remind instead of kick" as a switch on
+`autoKickAfterMinutes` would turn a Strict-locked kick into a notification, and `RuleWeakening` would
+have to police the switch. A sibling field only ever adds. A rule can have a reminder, a kick, or both.
+
+**It is the time kick's twin, on the same clock.**
+- `domain/autokick/UseReminderEvaluator` (pure) mirrors `TimeKickEvaluator`'s decisions (`START_SESSION`,
+  `REBASELINE`, `WAIT`) plus `OFF`, `SUPERSEDED_BY_KICK`, `ALREADY_REMINDED`, `REMIND`. A stored 0 is off,
+  never "remind immediately", the same rule as the kick's.
+- `AutoKickTimeHandler.tick(pkg)` does ONE usage read per tick for both consumers and returns
+  `Verdict.None | Kick | Remind(minutes)`. Baseline bookkeeping happens once, whichever consumer is
+  configured, so a reminder-only package gets a session baseline on its own. `shouldKick(pkg)` is the
+  kick-only view of the same pass, kept for the web clock, and it never consumes a reminder (a reminder
+  marked done by a call that cannot post it would be a dropped message).
+- **One per session**: `InteractionTracker.sessionReminded`, cleared in exactly the branches that clear
+  `sessionUsageBaseline` (the 5-minute `SESSION_EXPIRY_MS` on `onAppChanged`, and `resetSession`, which
+  the kick calls). So a quick tab-out-and-back neither re-arms the reminder nor restarts its countdown,
+  a real break starts a new session with its own reminder, and after a kick the next session has one
+  too. The flag is set by `tick` BEFORE the verdict is returned, so a post that fails is not retried
+  every 30s: one gentle notification, never a nag.
+
+**The kick wins.** `UseReminderEvaluator.effectiveMinutes(remind, kick)` is the one predicate: when the
+package also has a positive time kick at or below the reminder, the reminder is superseded and never
+fires (a notification at the minute you are thrown out says nothing the kick does not). A kick of 0 is
+"no kick" and never suppresses a reminder. Precedence is decided on the MERGED cache entry at read time,
+so a kick on one rule silences a later reminder on another rule for the same app. If both are due on the
+same tick (a slow tick), only the kick comes back. The editors show the same predicate as a hint under
+the field ("Auto-kick at 20 min comes first, so this reminder won't show"), pinned by an exhaustive
+grid test against the engine's predicate.
+
+**The cache admission fix that came with it.** A reminder-only rule draws nothing and kicks nothing, so
+without a cache entry the 30s clock never starts for it and the reminder silently never fires, the same
+hole a plain daily limit had before v1.18.4. `needsForegroundTimeTick` gained the reminder as its fourth
+arm, and the service's hand-kept `appEntries` filter was replaced by `CounterCacheRefresher.appEntryFor`,
+whose predicate is DERIVED from `needsForegroundTimeTick` (plus "wants a drawn overlay"). The next clock
+consumer joins the cache by being added to that one property; a class test asserts every clock field
+alone admits the rule and starts the clock. `configuresAutoKick` is unchanged: a reminder can never keep
+an auto-kick cooldown alive.
+
+**Delivery.** `service/UseReminderNotifier`: its own channel `nudge_usage_reminders` ("Usage
+reminders", `IMPORTANCE_DEFAULT`, mutable on its own), notification id 4, `PendingIntent` request code 4
+(uniqueness pinned by `SharedNamespaceUniquenessTest`). One id for every app, so a newer reminder
+replaces an older one instead of stacking. Tap opens Nudge's home screen. A refused post
+(`SecurityException`) is swallowed, as everywhere on the accessibility thread. The label is the app's
+`getApplicationLabel`, falling back to the package name.
+
+**Editors.** The editor (`UnifiedAppConfigScreen`, reached from Manage Apps)
+renders one shared `ui/components/UsageReminderSection`
+right under auto-kick: title + help + switch, a minutes field ("Remind me after", blank = off; switching
+on with an empty field fills 20 so the switch is never a no-op), the kick-precedence hint, and, while
+on, an error-coloured "Notifications are off" line that opens Nudge's notification settings. Turning it
+on on Android 13+ without `POST_NOTIFICATIONS` asks right there (`ui/components/NotificationAccess`,
+now shared with the "Bro. wtf." row). It lives on the app-level default rule only; feature-override and
+scheduled rules do not carry it (the clock is per package).
+
+**Not a weakening axis.** Like `showCounter`, `showTimeRemaining` and `grayscale`, a reminder enforces
+nothing, so adding, lowering, raising or removing one never asks for the Strict Mode challenge
+(`RuleWeakeningTest` pins all four, and that removing it alongside a raised kick still bites on the kick).
+
+**Scope: apps only.** `webEntriesFor` never carries a reminder (pinned by `CounterCacheWebEntriesTest`),
+and the help text says "Apps only" when the rule also blocks websites. A web reminder would need the
+site, not the browser, named in the notification; `docs/BACKLOG.md` has it.
+
+**Export/import** carries `remindAfterMinutes` (absent in an older file = null). Format version not
+bumped, same as `tabVanish`/`followingSteer`: an older importer ignores unknown per-rule keys.
+
+**Tests.** L1: `UseReminderEvaluatorTest`, `UseReminderTest` (copy, never scolds), `UseReminderTickTest`
+(20: fires once at N and not before, not again in the session, quick return keeps the session, a real
+break re-arms, `resetSession` after a kick re-arms, kick precedence in every shape, merged-rule
+precedence, zero values, failing and backwards reads, `shouldKick` never consumes it, per-package
+isolation), `CounterCacheRefresherMergeTest` (the fourth arm, `appEntryFor` and its class test),
+`UsageReminderInputTest`, `UnifiedAppConfigViewModelTest`,
+`RuleWeakeningTest`, `RuleExporterTest`, `ImportRulesUseCaseTest`, `NudgeDatabaseMigrationTest`. L6: the
+device script in the PR body (a 1-minute reminder, then `dumpsys notification` for id 4 on
+`nudge_usage_reminders`).
