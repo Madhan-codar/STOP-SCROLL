@@ -1,29 +1,35 @@
+
 name: Build Debug APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
+    paths:
+      - 'nudge/**'
+      - '.github/workflows/build-debug-apk.yml'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
       - uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Walk2Unlock unit tests & build Debug APK
+      - name: Build Debug APK
+        working-directory: nudge
         run: ./gradlew :app:testDebugUnitTest :app:assembleDebug
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: nudge-walk2unlock-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: nudge/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 30
